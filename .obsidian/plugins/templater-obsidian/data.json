@@ -1,0 +1,17 @@
+{
+  "templates_folder": "Templates",
+  "templates_pairs": [],
+  "trigger_on_file_creation": false,
+  "auto_jump_to_cursor": true,
+  "enable_system_commands": false,
+  "shell_path": "",
+  "user_functions": "",
+  "timeout": 0,
+  "syntax_highlighting": true,
+  "syntax_highlighting_mobile": false,
+  "allowed_functions": "",
+  "javascript_snippets_folder": "",
+  "allow_system_commands": false,
+  "inline_scripts_command": "",
+  "attachments_folder": "Assets"
+}

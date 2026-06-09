@@ -1,0 +1,18 @@
+{
+  "strictLineBreaks": false,
+  "showFrontmatter": false,
+  "defaultViewMode": "source",
+  "livePreview": true,
+  "readableLineLength": true,
+  "showLineNumber": true,
+  "foldHeading": true,
+  "foldIndent": true,
+  "showInlineTitle": true,
+  "alwaysUpdateLinks": true,
+  "newLinkFormat": "shortest",
+  "useMarkdownLinks": false,
+  "showUnsupportedFiles": false,
+  "trashOption": "local",
+  "deleteAttachmentOption": "trash",
+  "attachmentFolderPath": "Assets"
+}

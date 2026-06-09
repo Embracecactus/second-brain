@@ -1,0 +1,8 @@
+{
+  "shouldConfirmBeforeCreate": true,
+  "showWeeklyNote": false,
+  "weeklyNoteFormat": "gggg-[W]ww",
+  "weeklyNotePath": "",
+  "locale": "zh-cn",
+  "showWeekNum": true
+}
