@@ -1,23 +1,23 @@
 ---
-tags: [bug, {{平台}}]
+tags: [bug]
 severity: major
-created: {{date}}
-resolved:
+created: <% tp.date.now("YYYY-MM-DD") %>
+resolved: 
 ---
 
-# {{标题}}
+# <% tp.file.title %>
 
 ## 现象
->
+> 
 
 ## 原因
->
+> 
 
 ## 解决方案
->
+> 
 
 ## 预防措施
--
+- 
 
 ## 相关笔记
 - [[]]
