@@ -1,14 +1,4 @@
 ---
-tags: [stm32, cortex-m0, hal, makefile]
-category: mcu/stm32
-created: 2026-06-09
----
-Now I have all the information needed. Here is the comprehensive Obsidian markdown note:
-
----
-
-```markdown
----
 title: STM32G0B1 Makefile 工程模板
 tags:
   - stm32
@@ -49,7 +39,7 @@ toolchain: GCC (arm-none-eabi)
 
 ## 项目结构
 
-```
+
 stm32g0-make/
 ├── Core/
 │   ├── Inc/                    # 头文件

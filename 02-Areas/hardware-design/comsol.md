@@ -1,13 +1,4 @@
 ---
-tags: [comsol, piezoelectric, simulation]
-category: hardware-design
-created: 2026-06-09
----
-I now have enough information to generate the Obsidian note. The project is a COMSOL Multiphysics simulation project for piezoelectric analysis.
-
----
-```markdown
----
 title: COMSOL 压电仿真项目
 tags:
   - comsol
@@ -116,7 +107,6 @@ comsol batch -inputfile 压电.mph -outputfile 压电_result.mph
 
 - [COMSOL 官方文档 - Piezoelectric Devices](https://www.comsol.com/documentation)
 - [COMSOL Application Gallery - 压电案例](https://www.comsol.com/models/piezo-actuator)
-```
 
 ## 相关笔记
 

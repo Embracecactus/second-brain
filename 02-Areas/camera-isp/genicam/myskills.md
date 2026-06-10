@@ -1,12 +1,4 @@
 ---
-tags: [genicam, industrial-camera, sensor, fpga]
-category: camera-isp/genicam
-created: 2026-06-09
----
-Now I have enough information to generate a comprehensive Obsidian note. Let me compile all the knowledge extracted from this project.
-
-```markdown
----
 title: CamSkills - AI辅助工业相机固件开发技能包
 tags:
   - camera-isp
@@ -51,7 +43,7 @@ Skills 不是编译运行的软件，而是结构化的 Markdown 文档（SKILL.
 
 ### 标准 Skill 目录结构
 
-```
+
 {skill-name}/
 ├── SKILL.md           # Skill 定义（必需，含 YAML frontmatter）
 ├── knowledge/         # 结构化知识库（YAML/JSON）
@@ -188,7 +180,6 @@ Skills 部署到 `.codebuddy/skills/{skill-name}/SKILL.md`，使用 `skill-deplo
 - [[MVDF-Drv-Firmware]] - 目标固件工程项目
 - [[Cline-AI-Assistant]] - AI 编程助手平台
 - [[FPGA-Sequencer]] - FPGA 序列曝光控制
-```
 
 ## 相关笔记
 

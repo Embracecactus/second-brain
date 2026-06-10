@@ -1,12 +1,4 @@
 ---
-tags: [hugo, blog, azure, nginx]
-category: tools/hugo
-created: 2026-06-09
----
-I now have all the information needed. Here is the comprehensive Obsidian markdown note:
-
-```markdown
----
 title: "Hugo 个人技术博客 (web-blog)"
 tags:
   - hugo
@@ -48,7 +40,7 @@ project_path: /home/lijian/project/web/boke
 
 ### 系统架构
 
-```
+
 开发环境 (WSL2)                    生产环境 (Azure)
 ┌─────────────┐                   ┌──────────────────────────────┐
 │  Hugo 写作  │                   │  Nginx (:80)                 │

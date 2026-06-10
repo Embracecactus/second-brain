@@ -1,12 +1,4 @@
 ---
-tags: [allwinner, h3, uboot, debian]
-category: embedded-linux/allwinner
-created: 2026-06-09
----
-The Obsidian note has been generated at `/mnt/c/Users/lijian/workspace/h3-uboot-pack/h3-uboot-pack/H3-U-Boot-Pack.md`. Here is the content:
-
-```markdown
----
 title: H3 U-Boot Pack - Orange Pi PC U-Boot 打包工具
 category: embedded-linux/allwinner
 tags:
@@ -179,5 +171,3 @@ sudo dpkg -i uboot-orangepi_pc-v2021.04.deb
 - [[h5]] — Allwinner H5 Crust Firmware 项目
 - [[h618]] — H618 TV Box 定制 Linux 系统
 - [[orangepi]] — OrangePi PC 嵌入式 Linux 开发
-- [[make]] — Make 构建系统学习
-```

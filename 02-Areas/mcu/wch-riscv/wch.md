@@ -1,10 +1,4 @@
 ---
-tags: [wch, risc-v, ch32v208, ch582, kconfig]
-category: mcu/wch-riscv
-created: 2026-06-09
----
-```markdown
----
 title: WCH CH32V RISC-V MCU 项目
 tags:
   - mcu
@@ -43,7 +37,7 @@ status: active
 
 ### 目录结构
 
-```
+
 wch/
 ├── Kconfig                          # 顶层 Kconfig（芯片选择、SDK 路径、FreeRTOS 使能）
 ├── Makefile                         # 主构建脚本

@@ -1,10 +1,4 @@
 ---
-tags: [vuepress, github-pages]
-category: tools/vuepress
-created: 2026-06-09
----
-```markdown
----
 title: VuePress 知识库
 tags:
   - vuepress
@@ -43,7 +37,7 @@ status: active
 
 ### 项目目录结构
 
-```
+
 vuepress/
 ├── README.md                          # 安装配置指南 (Linux/Windows)
 ├── Embracecactus.github.io/           # 主站点项目 (GitHub Pages 部署)

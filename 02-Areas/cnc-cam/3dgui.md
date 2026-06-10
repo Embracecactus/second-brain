@@ -1,12 +1,4 @@
 ---
-tags: [cnc, gcode, 3d, webgl]
-category: cnc-cam
-created: 2026-06-09
----
-Now I have enough information to generate the Obsidian knowledge note. Let me compile the key findings.
-
-```yaml
----
 tags:
   - cnc-cam
   - 3d-graphics
@@ -20,9 +12,7 @@ status: draft
 project: 3dgui
 path: /home/lijian/project/3dgui
 ---
-```
 
-```markdown
 # 3dgui - 终端 3D G-Code 可视化渲染器
 
 ## 项目概述
@@ -153,7 +143,6 @@ bash build.sh
 - [[Bresenham画线算法]] - 光栅化直线绘制
 - [[ncurses终端编程]] - ncurses 库使用
 - [[嵌入式点阵字体]] - 位图字体与图标数据格式
-```
 
 ---
 

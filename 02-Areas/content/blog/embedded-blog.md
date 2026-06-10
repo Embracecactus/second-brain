@@ -1,14 +1,4 @@
 ---
-tags: [hugo, embedded, blog]
-category: content/blog
-created: 2026-06-09
----
-I now have a complete understanding of the project. Here is the Obsidian note:
-
----
-
-```markdown
----
 title: "embedded-blog - 嵌入式技术博客"
 tags:
   - blog
@@ -57,7 +47,7 @@ project_path: /mnt/c/Users/lijian/workspace/codebuudy/embedded-blog
 
 ## 项目结构
 
-```
+
 embedded-blog/
 ├── hugo.toml                      # Hugo 主配置文件
 ├── .gitmodules                    # git submodule 定义

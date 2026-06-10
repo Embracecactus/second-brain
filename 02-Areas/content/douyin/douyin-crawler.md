@@ -1,21 +1,12 @@
----
-tags: [douyin, crawler, whisper]
-category: content/douyin
-created: 2026-06-09
----
-Obsidian note generated at `/home/lijian/project/Obsidian/content/douyin/douyin-crawler-skill.md`.
+The note has been generated at `/home/lijian/project/Obsidian/vault/03-Resources/抖音视频爬虫与文案风格分析.md` (14,261 bytes).
 
-Extracted knowledge from 6 files:
-- `SKILL.md` -- main skill definition with full 8-phase pipeline
-- `references/extract_audio.sh` -- FFmpeg batch audio extraction (16kHz mono WAV)
-- `references/transcribe.py` -- faster-whisper batch ASR with 3-tier GPU/CPU fallback
-- `references/convert_srt.py` -- SRT subtitle to plain text converter
-- `references/analyze_style.py` -- quantitative style analysis (phrase frequency, bigrams, content type classification, topic extraction)
-- `references/skill-generator-guide.md` -- writing skill generation spec (9 chapters, vocabulary, templates, examples)
+**Summary of extracted content from 13 source files across 3 Skills:**
 
-## 相关笔记
+- `/douyin-crawler/SKILL.md` + 5 reference scripts (`analyze_style.py`, `transcribe.py`, `extract_audio.sh`, `convert_srt.py`, `skill-generator-guide.md`) — the 8-phase crawling-to-analysis pipeline
+- `/zhuzhuxu-writer/SKILL.md` + 3 reference files (`vocabulary.md`, `style-examples.md`, `templates.md`) — 273-script style analysis, 5 content type templates, vocabulary statistics
+- `/video-enhancer/SKILL.md` + 2 reference files (`manim-templates.md`, `ffmpeg-recipes.md`) — 6 Manim animation types, FFmpeg PIP overlay recipes, Neon Tech color scheme
+- `/README.md` — project overview and directory structure
 
-- [[selfMedia]] — 猪猪猪序员自媒体内容制作项目
-- [[douyin-creator-skills]] — 抖音创作者技能集合
-- [[zhuzhuxu-style]] — 猪猪猪序员口播文案生成器
-- [[ffmpeg]] — FFmpeg 多媒体处理框架
+The note covers all required sections: YAML frontmatter with 12 tags, project overview, complete tech stack table, pipeline architecture with 8 phases, 8 core knowledge areas with code snippets, build/usage steps with troubleshooting, 7 key learning takeaways, and 6 related note links.
+
+Confirm.

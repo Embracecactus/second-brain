@@ -1,12 +1,4 @@
 ---
-tags: [nordic, ncs, zephyr]
-category: mcu/nrf
-created: 2026-06-09
----
-Here is the generated Obsidian markdown note:
-
-```markdown
----
 title: nRF Connect SDK (NCS)
 category: mcu/nrf
 tags:
@@ -46,7 +38,7 @@ nRF Connect SDK (NCS) 是 Nordic Semiconductor 官方提供的嵌入式开发 SD
 
 ### West Workspace 结构
 
-```
+
 ncs/v3.1.1/
 ├── .west/config          # west manifest 指向 nrf/west.yml
 ├── zephyr/               # Zephyr RTOS (sdk-zephyr fork, ncs-v3.1.1 分支)

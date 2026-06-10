@@ -1,12 +1,4 @@
 ---
-tags: [wechat, miniprogram]
-category: app/wechat
-created: 2026-06-09
----
-Now I have a comprehensive understanding of the project. Let me generate the Obsidian note.
-
-```markdown
----
 title: weixinxiaoapp - 微信小程序项目合集
 created: 2026-06-09
 category: app/wechat
@@ -28,7 +20,7 @@ status: active
 
 ## 项目结构
 
-```
+
 weixinxiaoapp/
 ├── miniprogram-1/    # NFC 交互 + Skyline 渲染引擎
 ├── miniprogram-2/    # TypeScript + Sass 模板

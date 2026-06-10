@@ -1,13 +1,4 @@
 ---
-tags: [xiaohongshu, tutorial, iot]
-category: content/xiaohongshu
-created: 2026-06-09
----
-Here is the Obsidian markdown note:
-
----
-```markdown
----
 title: "Redbook - 小红书技术内容创作素材库"
 category: content/xiaohongshu
 tags:
@@ -153,7 +144,6 @@ cd project && idf.py build
 - [联犀体验账户](https://demo.unitedrhino.com/app/core/#/user/user-login?back_url=/app/core/)
 - [ESP-IDF 编程指南](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32/)
 - [MQTT 5.0 协议规范](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html)
-```
 
 ## 相关笔记
 
