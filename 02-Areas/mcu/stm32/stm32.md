@@ -39,7 +39,7 @@ toolchain: GCC (arm-none-eabi)
 
 ## 项目结构
 
-
+```
 stm32g0-make/
 ├── Core/
 │   ├── Inc/                    # 头文件
@@ -211,7 +211,6 @@ minicom -D /dev/ttyACM0 -b 115200
 - [STM32Cube FW_G0 固件包](https://github.com/STMicroelectronics/STM32CubeG0)
 - [NUCLEO-G0B1RE 开发板用户手册](https://www.st.com/resource/en/user_manual/um2398-stm32g0-nucleo-64-board-mb1360-stmicroelectronics.pdf)
 - [STM32CubeMX 用户指南](https://www.st.com/resource/en/user_manual/um1718-stm32cubmx-for-stm32-configuration-and-initialization-c-code-generation-stmicroelectronics.pdf)
-```
 
 ## 相关笔记
 
