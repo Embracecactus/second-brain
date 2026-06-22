@@ -1,0 +1,18585 @@
+---
+tags:
+  - embedded-linux
+  - v4l2
+  - uvc
+  - camera
+  - driver
+  - ftrace
+category: embedded-linux
+created: 2026-06-17
+updated: 2026-06-17
+status: active
+soc: Rockchip RV1126B
+kernel: Linux 6.1.141
+camera: UVC USB Camera (0ac8:3500, HD 720P Webcam)
+video_dev: /dev/video1
+---
+
+# 阶段二：V4L2 驱动深度（基于 UVC 相机）
+
+> **硬件说明**：当前无 MIPI ISP 相机，使用 USB UVC 相机代替。V4L2 核心框架完全相同（open → S_FMT → REQBUFS → QBUF → STREAMON → DQBUF），差异在底层驱动（UVC 走 USB，ISP 走 Media Controller）。
+
+---
+
+## 一、硬件拓扑
+
+### 1.1 摄像头设备确认
+
+通过 `dmesg | grep uvc` 和 `ls -la /dev/video*` 确认：
+
+| 设备节点 | 驱动 | 用途 |
+|----------|------|------|
+| /dev/video0 | (未知) | 板载其他设备 |
+| **/dev/video1** | **uvcvideo** | **USB 相机主视频流** |
+| /dev/video2 | uvcvideo | Metadata 通道 |
+
+### 1.2 相机能力
+
+```bash
+v4l2-ctl -d /dev/video1 --all
+```
+
+关键信息：
+
+| 属性 | 值 |
+|------|-----|
+| 驱动 | uvcvideo |
+| 型号 | HD 720P Webcam (Vimicro Corp.) |
+| USB ID | 0ac8:3500 |
+| 格式支持 | MJPG、YUYV |
+| 最大分辨率 | 1920x1080 |
+
+### 1.3 支持的分辨率
+
+通过 `v4l2-ctl -d /dev/video1 --list-framesizes=MJPG` 确认：
+
+```
+1920x1080, 1280x720, 848x480, 800x600, 640x480, 640x360, 432x240, 352x288
+```
+
+---
+
+## 二、V4L2 核心概念
+
+### 2.1 V4L2 设备类型
+
+| 类型 | 设备节点 | 说明 |
+|------|----------|------|
+| Video Capture | `/dev/videoX` | 采集视频帧 |
+| Video Output | `/dev/videoX` | 输出视频帧 |
+| Metadata | `/dev/videoX` | 元数据通道（UVC 的 payload header） |
+| Subdev | `/dev/v4l-subdevX` | 子设备（sensor、ISP 实体） |
+| Media | `/dev/mediaX` | 媒体控制器拓扑 |
+
+UVC 相机表现为一个 Video Capture 节点（/dev/video1）加一个 Metadata 节点（/dev/video2）。
+
+### 2.2 V4L2 采集流程（通用，无论 UVC 还是 ISP）
+
+```
+open() → VIDIOC_QUERYCAP → VIDIOC_S_FMT → VIDIOC_REQBUFS →
+VIDIOC_QBUF → VIDIOC_STREAMON → VIDIOC_DQBUF → 处理数据 →
+VIDIOC_QBUF(重新入队) → VIDIOC_STREAMOFF → close()
+```
+
+| ioctl | 作用 | 对应驱动函数 |
+|-------|------|------------|
+| VIDIOC_QUERYCAP | 查询设备能力 | `v4l2_querycap` |
+| VIDIOC_ENUM_FMT | 枚举支持的像素格式 | `v4l2_enum_fmt` |
+| VIDIOC_S_FMT | 设置采集格式 | `v4l2_s_fmt` → `uvc_v4l2_set_format` |
+| VIDIOC_REQBUFS | 申请帧缓冲区 | `vb2_ioctl_reqbufs` → `vb2_core_reqbufs` |
+| VIDIOC_QBUF | 缓冲区入队（交给驱动填数据） | `vb2_ioctl_qbuf` |
+| VIDIOC_DQBUF | 取出已填好数据的缓冲区 | `vb2_ioctl_dqbuf` |
+| VIDIOC_STREAMON | 启动采集 | `vb2_ioctl_streamon` → `uvc_video_start_streaming` |
+| VIDIOC_STREAMOFF | 停止采集 | `vb2_ioctl_streamoff` → `uvc_video_stop_streaming` |
+
+### 2.3 UVC vs ISP 差异
+
+| 维度 | UVC | MIPI ISP (RK) |
+|------|-----|---------------|
+| 驱动 | uvcvideo | rkisp1 |
+| 管线 | USB 摄像头自带 ISP | SoC 内部 ISP |
+| 格式协商 | 相机报告支持格式 | 通过 Media Controller 配链路 |
+| 像素格式 | MJPG / YUYV 为主 | RAW → NV12 |
+| 3A 算法 | 摄像头固件处理 | SoC 上的 RKAIQ 算法库 |
+| Subdev | 无 | sensor / csi / isp 多个 subdev |
+
+**核心结论**：用户态的 V4L2 ioctl 流程完全一样，换 ISP 相机时只需改像素格式和加 media-ctl 配置链路。
+
+---
+
+## 三、实验 1：手写 V4L2 采集程序（YUYV）
+
+### 3.1 实验目标
+
+写一个 C 程序从 `/dev/video1` 抓一帧 YUYV 格式图像保存为文件。
+
+### 3.2 前置知识：YUYV 像素格式
+
+YUYV 是 raw 格式，每个像素占 2 字节。1920x1080 一帧的大小固定为：`1920 * 1080 * 2 = 4,147,200 bytes`。
+
+内存布局（每 4 字节描述 2 个像素）：
+
+```
+[Y0][U0][Y1][V0] ← 像素 0 和像素 1 共用 UV
+[Y2][U2][Y3][V2] ← 像素 2 和像素 3 共用 UV
+```
+
+### 3.3 程序源码（v4l2-capture.c）
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/videodev2.h>
+
+struct buffer {
+    void   *start;
+    size_t  length;
+};
+
+int main(int argc, char *argv[])
+{
+    const char *dev_name = "/dev/video1";
+    int fd = open(dev_name, O_RDWR);
+    if (fd < 0) { perror("open"); return 1; }
+
+    /* 1. VIDIOC_QUERYCAP — 查询能力 */
+    struct v4l2_capability cap;
+    ioctl(fd, VIDIOC_QUERYCAP, &cap);
+    printf("driver: %s | card: %s\n", cap.driver, cap.card);
+
+    /* 2. VIDIOC_S_FMT — 设置 YUYV 1920x1080 */
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = 1920;
+    fmt.fmt.pix.height = 1080;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+        perror("S_FMT"); close(fd); return 1;
+    }
+    printf("fmt: %dx%d, fourcc: %c%c%c%c\n",
+        fmt.fmt.pix.width, fmt.fmt.pix.height,
+        fmt.fmt.pix.pixelformat & 0xff,
+        (fmt.fmt.pix.pixelformat >> 8) & 0xff,
+        (fmt.fmt.pix.pixelformat >> 16) & 0xff,
+        (fmt.fmt.pix.pixelformat >> 24) & 0xff);
+
+    /* 3. VIDIOC_REQBUFS — 申请 3 个 buffer */
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count = 3;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    ioctl(fd, VIDIOC_REQBUFS, &req);
+    printf("buffers: %d\n", req.count);
+
+    /* 4. mmap — 映射 buffer */
+    struct buffer *buffers = calloc(req.count, sizeof(*buffers));
+    for (int i = 0; i < req.count; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        ioctl(fd, VIDIOC_QUERYBUF, &buf);
+        buffers[i].length = buf.length;
+        buffers[i].start = mmap(NULL, buf.length,
+            PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        if (buffers[i].start == MAP_FAILED) {
+            perror("mmap"); exit(1);
+        }
+    }
+
+    /* 5. QBUF — 所有 buffer 入队 */
+    for (int i = 0; i < req.count; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        ioctl(fd, VIDIOC_QBUF, &buf);
+    }
+
+    /* 6. STREAMON — 开始采集 */
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ioctl(fd, VIDIOC_STREAMON, &type);
+
+    /* 7. DQBUF — 取一帧 */
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    ioctl(fd, VIDIOC_DQBUF, &buf);
+    printf("frame #%u, %u bytes\n", buf.sequence, buf.bytesused);
+
+    /* 8. 保存文件 */
+    FILE *fp = fopen("frame.yuv", "wb");
+    fwrite(buffers[buf.index].start, 1, buf.bytesused, fp);
+    fclose(fp);
+
+    /* 9. 清理 */
+    ioctl(fd, VIDIOC_STREAMOFF, &type);
+    for (int i = 0; i < req.count; i++)
+        munmap(buffers[i].start, buffers[i].length);
+    free(buffers);
+    close(fd);
+    printf("Saved frame.yuv\n");
+    return 0;
+}
+```
+
+### 3.4 编译 & 运行
+
+```bash
+# PC 端交叉编译
+export PATH=$PWD/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin:$PATH
+aarch64-none-linux-gnu-gcc -static -o v4l2-capture v4l2-capture.c
+scp v4l2-capture rooter@192.168.1.109:/tmp/
+
+# 板端运行
+sudo /tmp/v4l2-capture
+```
+
+### 3.5 验证结果
+
+```bash
+ls -la /tmp/frame.yuv
+# 预期: 4147200 bytes (1920*1080*2)
+```
+
+> 如果程序里设的是 NV12 但相机不支持，V4L2 驱动会自动降级为支持的格式（如 MJPG）。
+> 用 `v4l2-ctl -d /dev/video1 --get-fmt-video` 可查实际生效的格式。
+
+### 3.6 常见问题
+
+| 问题 | 原因 |
+|------|------|
+| open 失败 | 需要 sudo 权限 |
+| VIDIOC_S_FMT 后格式不对 | 相机不支持请求的 fourcc，驱动自动降级 |
+| VIDIOC_REQBUFS 失败 | 驱动不支持 MMAP，需换 dmabuf |
+| frame.yuv 只有 200 多 KB | 实际是 MJPG 压缩数据，不是 raw YUYV |
+
+---
+
+## 四、实验 2：用 Ftrace 追踪 V4L2 驱动路径
+
+### 4.1 实验目标
+
+用 ftrace `function_graph` 追踪从 `open("/dev/video1")` 到 `DQBUF` 的 UVC 驱动调用链。
+
+### 4.2 操作步骤
+
+> ⚠️ 注意：tracefs 和 debugfs 文件写入必须用 `tee`，不能用 `sudo echo > file`，因为 `>` 重定向由 shell 执行不受 sudo 控制。
+
+```bash
+# 启动 function_graph 追踪
+echo function_graph | sudo tee /sys/kernel/tracing/current_tracer
+
+# 只追踪 V4L2 和 UVC 相关函数
+echo '*v4l*' | sudo tee /sys/kernel/tracing/set_ftrace_filter
+echo '*videobuf*' | sudo tee -a /sys/kernel/tracing/set_ftrace_filter
+echo '*vb2*' | sudo tee -a /sys/kernel/tracing/set_ftrace_filter
+echo '*uvc*' | sudo tee -a /sys/kernel/tracing/set_ftrace_filter
+
+# 限制追踪深度（防止输出太长）
+echo 512 | sudo tee /sys/kernel/tracing/max_graph_depth
+
+# 清缓冲区
+echo | sudo tee /sys/kernel/tracing/trace
+
+# 运行采集程序
+sudo ./v4l2-capture
+
+# 保存追踪结果
+sudo cat /sys/kernel/tracing/trace > /tmp/v4l2_trace.log
+
+# 关追踪
+echo nop | sudo tee /sys/kernel/tracing/current_tracer
+```
+
+### 4.3 分析 trace.log
+
+```bash
+# scp 回 PC
+scp rooter@192.168.1.109:/tmp/v4l2_trace.log .
+
+# 看 S_FMT 的完整调用链（最耗时）
+grep -B1 -A 50 'uvc_ioctl_s_fmt_vid_cap' v4l2_trace.log | head -60
+
+# 看 STREAMON（启动 USB 传输）
+grep -A 30 'ubmit_urb\|start_streaming' v4l2_trace.log | head -40
+
+# 统计总行数
+wc -l v4l2_trace.log
+```
+
+### 4.4 实测结果
+
+**环境**：RV1126B + UVC 相机 (/dev/video1)，YUYV 1920x1080
+
+**Ftrace 输出规模**：18570 行
+
+**各 ioctl 耗时**：
+
+| ioctl | 耗时 | 关键子函数 |
+|-------|------|-----------|
+# tracer: function_graph
+#
+# CPU  DURATION                  FUNCTION CALLS
+# |     |   |                     |   |   |   |
+ 2)               |  v4l2_open() {
+ 2)               |    uvc_v4l2_open() {
+ 2)               |      uvc_resume() {
+ 2)   5.250 us    |        __uvc_resume();
+ 2) + 19.250 us   |      }
+ 2)               |      uvc_resume() {
+ 2)               |        __uvc_resume() {
+ 2)   2.625 us    |          uvc_video_resume();
+ 2)   7.875 us    |        }
+ 2) + 12.542 us   |      }
+ 2) + 16.333 us   |      uvc_status_start();
+ 2)   4.666 us    |      v4l2_fh_init();
+ 2)               |      v4l2_fh_add() {
+ 2)               |        v4l2_prio_open() {
+ 2)   2.333 us    |          v4l2_prio_change();
+ 2)   7.291 us    |        }
+ 2) + 13.708 us   |      }
+ 2) * 88842.20 us |    }
+ 2) * 88859.41 us |  }
+ 2)               |  v4l2_ioctl() {
+ 2)               |    v4l_querycap() {
+ 2)   7.875 us    |      uvc_ioctl_querycap();
+ 2) + 13.125 us   |    }
+ 2) + 24.500 us   |  }
+ 2)               |  v4l2_ioctl() {
+ 2)   2.625 us    |    v4l2_prio_check();
+ 2)               |    v4l_s_fmt() {
+ 2)   4.084 us    |      v4l_enable_media_source();
+ 2)               |      v4l_sanitize_format() {
+ 2)   2.625 us    |        v4l_sanitize_colorspace();
+ 2)   7.000 us    |      }
+ 2)               |      uvc_ioctl_s_fmt_vid_cap() {
+ 2)   2.333 us    |        uvc_acquire_privileges();
+ 2)               |        uvc_v4l2_try_format() {
+ 2)   2.625 us    |          uvc_try_frame_interval.isra.0();
+ 2)               |          uvc_probe_video() {
+ 2) ! 400.166 us  |            uvc_set_video_ctrl();
+ 2) ! 162.458 us  |            uvc_get_video_ctrl.constprop.0();
+ 2) ! 169.750 us  |            uvc_get_video_ctrl.constprop.0();
+ 2) ! 251.708 us  |            uvc_set_video_ctrl();
+ 2) ! 158.375 us  |            uvc_get_video_ctrl.constprop.0();
+ 2) # 1162.291 us |          }
+ 2) # 1175.125 us |        }
+ 2)   4.083 us    |        uvc_queue_allocated();
+ 2) # 1192.917 us |      }
+ 2) # 1215.667 us |    }
+ 2) # 1232.583 us |  }
+ 2)               |  v4l2_ioctl() {
+ 2)   2.916 us    |    v4l2_prio_check();
+ 2)               |    v4l_reqbufs() {
+ 2)               |      uvc_ioctl_reqbufs() {
+ 2)   2.625 us    |        uvc_acquire_privileges();
+ 2)               |        uvc_request_buffers() {
+ 2)               |          vb2_reqbufs() {
+ 2)   3.500 us    |            vb2_verify_memory_type();
+ 2)               |            vb2_core_reqbufs() {
+ 2)   2.625 us    |              uvc_queue_setup();
+ 2)               |              __vb2_queue_alloc() {
+ 2)   2.625 us    |                __init_vb2_v4l2_buffer();
+ 2) # 1550.500 us |                vb2_vmalloc_alloc();
+ 2)   3.791 us    |                __init_vb2_v4l2_buffer();
+ 2) # 1437.625 us |                vb2_vmalloc_alloc();
+ 2)   2.917 us    |                __init_vb2_v4l2_buffer();
+ 2) # 1423.917 us |                vb2_vmalloc_alloc();
+ 2) # 4452.874 us |              }
+ 2) # 4469.208 us |            }
+ 2) # 4480.291 us |          }
+ 2) # 4486.416 us |        }
+ 2) # 4497.208 us |      }
+ 2) # 4503.625 us |    }
+ 2) # 4521.125 us |  }
+ 2)               |  v4l2_ioctl() {
+ 2)               |    v4l_querybuf() {
+ 2)               |      uvc_ioctl_querybuf() {
+ 2)               |        uvc_query_buffer() {
+ 2)               |          vb2_querybuf() {
+ 2)               |            vb2_core_querybuf() {
+ 2)               |              __fill_v4l2_buffer() {
+ 2)               |                vb2_buffer_in_use() {
+ 2)   2.333 us    |                  vb2_vmalloc_num_users();
+ 2)   7.875 us    |                }
+ 2) + 14.000 us   |              }
+ 2) + 18.958 us   |            }
+ 2) + 23.917 us   |          }
+ 2) + 30.334 us   |        }
+ 2) + 35.000 us   |      }
+ 2) + 41.125 us   |    }
+ 2) + 52.208 us   |  }
+ 2)               |  v4l2_mmap() {
+ 2)               |    uvc_v4l2_mmap() {
+ 2)               |      uvc_queue_mmap() {
+ 2)               |        vb2_mmap() {
+ 2)               |          vb2_vmalloc_mmap() {
+ 2)   9.917 us    |            vb2_common_vm_open();
+ 2) # 1024.625 us |          }
+ 2) # 1031.333 us |        }
+ 2) # 1036.583 us |      }
+ 2) # 1041.833 us |    }
+ 2) # 1047.375 us |  }
+ 2)               |  v4l2_ioctl() {
+ 2)               |    v4l_querybuf() {
+ 2)               |      uvc_ioctl_querybuf() {
+ 2)               |        uvc_query_buffer() {
+ 2)               |          vb2_querybuf() {
+ 2)               |            vb2_core_querybuf() {
+ 2)               |              __fill_v4l2_buffer() {
+ 2)               |                vb2_buffer_in_use() {
+ 2)   2.625 us    |                  vb2_vmalloc_num_users();
+ 2)   7.291 us    |                }
+ 2) + 12.833 us   |              }
+ 2) + 17.791 us   |            }
+ 2) + 22.458 us   |          }
+ 2) + 28.875 us   |        }
+ 2) + 33.542 us   |      }
+ 2) + 39.083 us   |    }
+ 2) + 48.417 us   |  }
+ 2)               |  v4l2_mmap() {
+ 2)               |    uvc_v4l2_mmap() {
+ 2)               |      uvc_queue_mmap() {
+ 2)               |        vb2_mmap() {
+ 2)               |          vb2_vmalloc_mmap() {
+ 2)   3.208 us    |            vb2_common_vm_open();
+ 2) ! 874.709 us  |          }
+ 2) ! 881.125 us  |        }
+ 2) ! 885.208 us  |      }
+ 2) ! 890.459 us  |    }
+ 2) ! 895.416 us  |  }
+ 2)               |  v4l2_ioctl() {
+ 2)               |    v4l_querybuf() {
+ 2)               |      uvc_ioctl_querybuf() {
+ 2)               |        uvc_query_buffer() {
+ 2)               |          vb2_querybuf() {
+ 2)               |            vb2_core_querybuf() {
+ 2)               |              __fill_v4l2_buffer() {
+ 2)               |                vb2_buffer_in_use() {
+ 2)   2.625 us    |                  vb2_vmalloc_num_users();
+ 2)   7.292 us    |                }
+ 2) + 12.542 us   |              }
+ 2) + 16.917 us   |            }
+ 2) + 21.583 us   |          }
+ 2) + 26.834 us   |        }
+ 2) + 31.500 us   |      }
+ 2) + 36.167 us   |    }
+ 2) + 43.458 us   |  }
+ 2)               |  v4l2_mmap() {
+ 2)               |    uvc_v4l2_mmap() {
+ 2)               |      uvc_queue_mmap() {
+ 2)               |        vb2_mmap() {
+ 2)               |          vb2_vmalloc_mmap() {
+ 2)   3.208 us    |            vb2_common_vm_open();
+ 2) ! 875.583 us  |          }
+ 2) ! 881.125 us  |        }
+ 2) ! 886.084 us  |      }
+ 2) ! 890.458 us  |    }
+ 2) ! 895.125 us  |  }
+ 2)               |  v4l2_ioctl() {
+ 2)               |    v4l_qbuf() {
+ 2)               |      uvc_ioctl_qbuf() {
+ 2)               |        uvc_queue_buffer() {
+ 2)               |          vb2_qbuf() {
+ 2)   4.958 us    |            vb2_queue_or_prepare_buf();
+ 2)               |            vb2_core_qbuf() {
+ 2)   2.625 us    |              __fill_vb2_buffer();
+ 2)               |              uvc_buffer_prepare() {
+ 2)               |                vb2_plane_vaddr() {
+ 2)   2.625 us    |                  vb2_vmalloc_vaddr();
+ 2)   7.000 us    |                }
+ 2) + 11.958 us   |              }
+ 2)               |              __fill_v4l2_buffer() {
+ 2)               |                vb2_buffer_in_use() {
+ 2)   2.334 us    |                  vb2_vmalloc_num_users();
+ 2)   6.708 us    |                }
+ 2) + 11.667 us   |              }
+ 2) + 38.500 us   |            }
+ 2) + 51.041 us   |          }
+ 2) + 56.584 us   |        }
+ 2) + 61.250 us   |      }
+ 2) + 66.792 us   |    }
+ 2) + 75.250 us   |  }
+ 2)               |  v4l2_ioctl() {
+ 2)               |    v4l_qbuf() {
+ 2)               |      uvc_ioctl_qbuf() {
+ 2)               |        uvc_queue_buffer() {
+ 2)               |          vb2_qbuf() {
+ 2)   2.625 us    |            vb2_queue_or_prepare_buf();
+ 2)               |            vb2_core_qbuf() {
+ 2)   2.625 us    |              __fill_vb2_buffer();
+ 2)               |              uvc_buffer_prepare() {
+ 2)               |                vb2_plane_vaddr() {
+ 2)   2.041 us    |                  vb2_vmalloc_vaddr();
+ 2)   6.709 us    |                }
+ 2) + 11.375 us   |              }
+ 2)               |              __fill_v4l2_buffer() {
+ 2)               |                vb2_buffer_in_use() {
+ 2)   2.333 us    |                  vb2_vmalloc_num_users();
+ 2)   6.709 us    |                }
+ 2) + 11.667 us   |              }
+ 2) + 34.417 us   |            }
+ 2) + 44.041 us   |          }
+ 2) + 49.292 us   |        }
+ 2) + 56.000 us   |      }
+ 2) + 60.667 us   |    }
+ 2) + 67.083 us   |  }
+ 2)               |  v4l2_ioctl() {
+ 2)               |    v4l_qbuf() {
+ 2)               |      uvc_ioctl_qbuf() {
+ 2)               |        uvc_queue_buffer() {
+ 2)               |          vb2_qbuf() {
+ 2)   2.625 us    |            vb2_queue_or_prepare_buf();
+ 2)               |            vb2_core_qbuf() {
+ 2)   2.334 us    |              __fill_vb2_buffer();
+ 2)               |              uvc_buffer_prepare() {
+ 2)               |                vb2_plane_vaddr() {
+ 2)   2.334 us    |                  vb2_vmalloc_vaddr();
+ 2)   6.708 us    |                }
+ 2) + 11.375 us   |              }
+ 2)               |              __fill_v4l2_buffer() {
+ 2)               |                vb2_buffer_in_use() {
+ 2)   2.042 us    |                  vb2_vmalloc_num_users();
+ 2)   7.000 us    |                }
+ 2) + 11.667 us   |              }
+ 2) + 35.000 us   |            }
+ 2) + 44.042 us   |          }
+ 2) + 49.291 us   |        }
+ 2) + 53.959 us   |      }
+ 2) + 58.625 us   |    }
+ 2) + 64.750 us   |  }
+ 2)               |  v4l2_ioctl() {
+ 2)   2.916 us    |    v4l2_prio_check();
+ 2)               |    v4l_streamon() {
+ 2)               |      uvc_ioctl_streamon() {
+ 2)               |        uvc_queue_streamon() {
+ 2)               |          vb2_streamon() {
+ 2)               |            vb2_core_streamon() {
+ 2)   2.625 us    |              v4l_vb2q_enable_media_source();
+ 2)               |              vb2_start_streaming() {
+ 2)   4.083 us    |                uvc_buffer_queue();
+ 2)   4.084 us    |                uvc_buffer_queue();
+ 2)   3.792 us    |                uvc_buffer_queue();
+ 2)               |                uvc_start_streaming() {
+ 2)               |                  uvc_video_start_streaming() {
+ 2) ! 323.458 us  |                    uvc_set_video_ctrl();
+ 2)               |                    uvc_video_start_transfer() {
+ 2)   6.709 us    |                      uvc_find_endpoint();
+ 2)   4.375 us    |                      uvc_find_endpoint();
+ 2)   4.375 us    |                      uvc_find_endpoint();
+ 2)   4.375 us    |                      uvc_find_endpoint();
+ 2)   4.375 us    |                      uvc_find_endpoint();
+ 2)   4.083 us    |                      uvc_find_endpoint();
+ 2)   4.375 us    |                      uvc_find_endpoint();
+ 2)   4.375 us    |                      uvc_find_endpoint();
+ 2) # 3418.042 us |                      uvc_alloc_urb_buffers.part.0();
+ 2) + 82.834 us   |                      uvc_submit_urb();
+ 2) + 70.584 us   |                      uvc_submit_urb();
+ 2) + 72.917 us   |                      uvc_submit_urb();
+ 2) + 77.292 us   |                      uvc_submit_urb();
+ 2) + 70.000 us   |                      uvc_submit_urb();
+ 2) # 5986.167 us |                    }
+ 2) # 6836.667 us |                  }
+ 2) # 6843.375 us |                }
+ 2) # 6869.625 us |              }
+ 2) # 6881.583 us |            }
+ 2) # 6888.292 us |          }
+ 2) # 6895.875 us |        }
+ 2) # 6904.041 us |      }
+ 2) # 6910.750 us |    }
+ 2) # 6925.625 us |  }
+ 2)               |  v4l2_ioctl() {
+ 2)               |    v4l_dqbuf() {
+ 2)               |      uvc_ioctl_dqbuf() {
+ 2)               |        uvc_dequeue_buffer() {
+ 2)               |          vb2_dqbuf() {
+ 2)               |            vb2_core_dqbuf() {
+ 2)   4.375 us    |              vb2_ops_wait_prepare();
+ 0)               |  uvc_video_complete() {
+ 0)   7.875 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 72.042 us   |    uvc_submit_urb();
+ 0) ! 367.208 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   7.000 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.833 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 365.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 252.291 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 367.209 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 251.125 us  |    }
+ 0) + 70.000 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.791 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.791 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 251.125 us  |    }
+ 0) + 69.708 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 360.792 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0) ! 143.208 us  |    }
+ 0) + 44.041 us   |    uvc_submit_urb();
+ 0) ! 213.500 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0) ! 143.792 us  |    }
+ 0) + 45.208 us   |    uvc_submit_urb();
+ 0) ! 213.791 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.083 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   3.500 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0) ! 143.792 us  |    }
+ 0) + 45.500 us   |    uvc_submit_urb();
+ 0) ! 214.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0) ! 142.917 us  |    }
+ 0) + 45.791 us   |    uvc_submit_urb();
+ 0) ! 213.500 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   3.208 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0) ! 144.375 us  |    }
+ 0) + 45.500 us   |    uvc_submit_urb();
+ 0) ! 214.958 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 365.458 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.541 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 365.459 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 247.916 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 249.083 us  |    }
+ 0) + 68.542 us   |    uvc_submit_urb();
+ 0) ! 359.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.791 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 360.792 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 251.125 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 364.583 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.208 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 362.250 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.208 us  |    }
+ 0) + 69.708 us   |    uvc_submit_urb();
+ 0) ! 361.958 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 251.417 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 366.042 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.000 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.083 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.666 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 363.708 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 249.084 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 365.458 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.083 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.666 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 362.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.541 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 362.250 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 360.792 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.833 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.208 us  |    }
+ 0) + 69.708 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.208 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 361.667 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.000 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.666 us  |    }
+ 0) + 70.000 us   |    uvc_submit_urb();
+ 0) ! 361.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 249.667 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 364.583 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 365.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.208 us  |    }
+ 0) + 71.459 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.000 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 364.584 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 249.083 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 251.125 us  |    }
+ 0) + 70.584 us   |    uvc_submit_urb();
+ 0) ! 365.459 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.375 us  |    }
+ 0) + 70.291 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.083 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.250 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 252.000 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.084 us  |    }
+ 0) + 69.416 us   |    uvc_submit_urb();
+ 0) ! 361.667 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.666 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.375 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 360.792 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.084 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0) ! 123.666 us  |    }
+ 0) + 49.875 us   |    uvc_submit_urb();
+ 0) ! 206.208 us  |  }
+ ------------------------------------------
+ 0)    <idle>-0    =>  head-100468  
+ ------------------------------------------
+
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0) ! 121.042 us  |    }
+ 0) + 49.583 us   |    uvc_submit_urb();
+ 0) ! 202.417 us  |  }
+ ------------------------------------------
+ 0)  head-100468   =>    <idle>-0   
+ ------------------------------------------
+
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0) ! 125.125 us  |    }
+ 0) + 50.459 us   |    uvc_submit_urb();
+ 0) ! 207.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0) ! 135.625 us  |    }
+ 0) + 52.500 us   |    uvc_submit_urb();
+ 0) ! 224.291 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.083 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0) ! 120.750 us  |    }
+ 0) + 49.875 us   |    uvc_submit_urb();
+ 0) ! 200.667 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0) ! 123.375 us  |    }
+ 0) + 50.750 us   |    uvc_submit_urb();
+ 0) ! 205.917 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.667 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0)   1.750 us    |      uvc_video_decode_start();
+ 0) ! 121.333 us  |    }
+ 0) + 51.625 us   |    uvc_submit_urb();
+ 0) ! 205.041 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.666 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   5.250 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0) ! 146.125 us  |    }
+ 0) + 51.042 us   |    uvc_submit_urb();
+ 0) ! 227.208 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.083 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0) ! 142.917 us  |    }
+ 0) + 47.542 us   |    uvc_submit_urb();
+ 0) ! 218.166 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0) ! 142.625 us  |    }
+ 0) + 43.750 us   |    uvc_submit_urb();
+ 0) ! 212.041 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   3.209 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0) ! 143.792 us  |    }
+ 0) + 44.041 us   |    uvc_submit_urb();
+ 0) ! 213.500 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.083 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0) ! 142.916 us  |    }
+ 0) + 43.750 us   |    uvc_submit_urb();
+ 0) ! 212.041 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   3.208 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0) ! 143.791 us  |    }
+ 0) + 43.458 us   |    uvc_submit_urb();
+ 0) ! 212.334 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.083 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0) ! 143.208 us  |    }
+ 0) + 43.458 us   |    uvc_submit_urb();
+ 0) ! 212.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 365.166 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 365.166 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 363.709 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 366.041 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.375 us  |    }
+ 0) + 71.750 us   |    uvc_submit_urb();
+ 0) ! 365.166 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 251.125 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 365.750 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 365.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.083 us  |    }
+ 0) + 69.708 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 251.125 us  |    }
+ 0) + 71.750 us   |    uvc_submit_urb();
+ 0) ! 368.667 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.958 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 365.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.541 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 362.834 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.208 us  |    }
+ 0) + 69.416 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 361.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.708 us   |    uvc_submit_urb();
+ 0) ! 361.958 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 251.416 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 366.042 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 247.917 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 71.459 us   |    uvc_submit_urb();
+ 0) ! 365.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 251.125 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 365.458 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.833 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 365.166 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 249.375 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 365.750 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.958 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 69.416 us   |    uvc_submit_urb();
+ 0) ! 363.708 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 247.917 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 361.958 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.209 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 360.500 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.416 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.000 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 360.500 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.959 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 364.291 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 364.584 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 71.459 us   |    uvc_submit_urb();
+ 0) ! 363.708 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 71.459 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 247.917 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 362.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 71.459 us   |    uvc_submit_urb();
+ 0) ! 365.459 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 249.959 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 366.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.750 us   |    uvc_submit_urb();
+ 0) ! 363.708 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.416 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.084 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 361.667 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.084 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 361.666 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 252.000 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 366.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 364.583 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 249.959 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 364.291 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.375 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.834 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 365.166 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 365.458 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.084 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 363.708 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.833 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.666 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 362.834 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.541 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 363.708 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.750 us   |    uvc_submit_urb();
+ 0) ! 365.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 249.959 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 364.583 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.791 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 251.417 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 366.334 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 363.416 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 365.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 360.500 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.834 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 361.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 362.250 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 360.209 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.834 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 70.292 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.833 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 366.042 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.834 us  |    }
+ 0) + 70.584 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.083 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 366.041 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 365.458 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 247.916 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 361.959 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.416 us   |    uvc_submit_urb();
+ 0) ! 362.834 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 249.375 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.958 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.084 us  |    }
+ 0) + 69.416 us   |    uvc_submit_urb();
+ 0) ! 361.959 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.834 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 69.416 us   |    uvc_submit_urb();
+ 0) ! 363.416 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 71.750 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.541 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 365.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.000 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.083 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 364.583 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 362.834 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 363.416 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 363.416 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 362.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.209 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 361.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.375 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 361.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 249.958 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 362.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.209 us  |    }
+ 0) + 71.459 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 365.458 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 364.292 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.791 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 70.000 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.209 us  |    }
+ 0) + 69.709 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.541 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.375 us  |    }
+ 0) + 70.000 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 247.916 us  |    }
+ 0) + 69.708 us   |    uvc_submit_urb();
+ 0) ! 361.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 365.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.834 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.209 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 363.416 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 71.459 us   |    uvc_submit_urb();
+ 0) ! 365.459 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 249.667 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 363.708 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 364.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 69.708 us   |    uvc_submit_urb();
+ 0) ! 361.958 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.417 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.791 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 360.500 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 361.084 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 365.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.791 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.833 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 365.750 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 365.166 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.791 us  |    }
+ 0) + 71.750 us   |    uvc_submit_urb();
+ 0) ! 363.709 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.542 us  |    }
+ 0) + 71.458 us   |    uvc_submit_urb();
+ 0) ! 365.458 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 70.584 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 364.584 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.000 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 69.709 us   |    uvc_submit_urb();
+ 0) ! 363.708 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.084 us  |    }
+ 0) + 68.834 us   |    uvc_submit_urb();
+ 0) ! 361.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 249.959 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.083 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.667 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 250.833 us  |    }
+ 0) + 68.542 us   |    uvc_submit_urb();
+ 0) ! 362.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 363.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 69.708 us   |    uvc_submit_urb();
+ 0) ! 361.666 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 250.833 us  |    }
+ 0) + 70.292 us   |    uvc_submit_urb();
+ 0) ! 364.292 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 70.583 us   |    uvc_submit_urb();
+ 0) ! 364.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.792 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 365.458 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.791 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 71.459 us   |    uvc_submit_urb();
+ 0) ! 364.583 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.375 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 363.708 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.959 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 364.583 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.208 us  |    }
+ 0) + 71.167 us   |    uvc_submit_urb();
+ 0) ! 364.583 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.084 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 249.958 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 362.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.000 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 248.208 us  |    }
+ 0) + 68.250 us   |    uvc_submit_urb();
+ 0) ! 357.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 250.250 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 362.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 68.833 us   |    uvc_submit_urb();
+ 0) ! 361.958 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 249.375 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 361.958 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.541 us  |    }
+ 0) + 69.125 us   |    uvc_submit_urb();
+ 0) ! 363.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 248.500 us  |    }
+ 0) + 70.875 us   |    uvc_submit_urb();
+ 0) ! 362.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0) ! 250.833 us  |    }
+ 0) + 71.166 us   |    uvc_submit_urb();
+ 0) ! 365.750 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) + 18.084 us   |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 398.708 us  |    }
+ 0) ! 451.500 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 74.959 us   |    uvc_submit_urb();
+ 1) ! 169.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 777.292 us  |    }
+ 0) ! 827.459 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.958 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 74.667 us   |    uvc_submit_urb();
+ 1) ! 409.209 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 776.709 us  |    }
+ 0) ! 826.875 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 85.750 us   |    uvc_submit_urb();
+ 1) ! 419.416 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 11.375 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 779.041 us  |    }
+ 0) ! 830.083 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1) + 74.958 us   |    uvc_submit_urb();
+ 1) ! 408.625 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 775.542 us  |    }
+ 0) ! 826.875 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 74.958 us   |    uvc_submit_urb();
+ 1) ! 414.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.791 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 776.709 us  |    }
+ 0) ! 827.750 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.959 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 75.542 us   |    uvc_submit_urb();
+ 1) ! 415.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 776.708 us  |    }
+ 0) ! 828.042 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 88.375 us   |    uvc_submit_urb();
+ 1) ! 425.250 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.791 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 778.750 us  |    }
+ 0) ! 830.083 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   5.833 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 82.833 us   |    uvc_submit_urb();
+ 1) ! 429.917 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 777.292 us  |    }
+ 0) ! 828.625 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 82.542 us   |    uvc_submit_urb();
+ 1) ! 420.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.375 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 777.875 us  |    }
+ 0) ! 829.208 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.959 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   5.833 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 72.917 us   |    uvc_submit_urb();
+ 1) ! 410.958 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.791 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 776.708 us  |    }
+ 0) ! 827.750 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.958 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 72.917 us   |    uvc_submit_urb();
+ 1) ! 411.833 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 12.542 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 778.459 us  |    }
+ 0) ! 829.500 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   5.834 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 72.917 us   |    uvc_submit_urb();
+ 1) ! 417.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 778.167 us  |    }
+ 0) ! 829.500 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 72.917 us   |    uvc_submit_urb();
+ 1) ! 408.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.375 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 776.708 us  |    }
+ 0) ! 828.625 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   6.125 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 74.375 us   |    uvc_submit_urb();
+ 1) ! 417.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   5.250 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.791 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.416 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 776.416 us  |    }
+ 0) ! 827.459 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   5.833 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 75.542 us   |    uvc_submit_urb();
+ 1) ! 422.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 11.667 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 776.708 us  |    }
+ 0) ! 828.917 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 75.250 us   |    uvc_submit_urb();
+ 1) ! 409.209 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) ! 777.291 us  |    }
+ 0) ! 828.334 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   6.417 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1) + 80.209 us   |    uvc_submit_urb();
+ 1) ! 423.500 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 11.083 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) ! 777.875 us  |    }
+ 0) ! 829.208 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 75.541 us   |    uvc_submit_urb();
+ 1) ! 413.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   5.250 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 776.417 us  |    }
+ 0) ! 827.750 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   5.833 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 74.958 us   |    uvc_submit_urb();
+ 1) ! 415.042 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.709 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 11.083 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 777.584 us  |    }
+ 0) ! 828.625 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.959 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 74.666 us   |    uvc_submit_urb();
+ 1) ! 418.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 777.584 us  |    }
+ 0) ! 828.916 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   5.833 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1) + 79.916 us   |    uvc_submit_urb();
+ 1) ! 422.916 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 777.000 us  |    }
+ 0) ! 828.042 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   6.125 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 74.959 us   |    uvc_submit_urb();
+ 1) ! 417.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 777.000 us  |    }
+ 0) ! 828.333 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1) + 72.917 us   |    uvc_submit_urb();
+ 1) ! 409.500 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 11.375 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 778.458 us  |    }
+ 0) ! 829.792 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   5.834 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 73.792 us   |    uvc_submit_urb();
+ 1) ! 410.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.791 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 776.125 us  |    }
+ 0) ! 827.458 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1) + 79.042 us   |    uvc_submit_urb();
+ 1) ! 422.625 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 777.000 us  |    }
+ 0) ! 828.042 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   5.833 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 73.208 us   |    uvc_submit_urb();
+ 1) ! 412.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) ! 777.000 us  |    }
+ 0) ! 828.625 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 73.500 us   |    uvc_submit_urb();
+ 1) ! 411.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 776.417 us  |    }
+ 0) ! 827.166 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   6.125 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 73.500 us   |    uvc_submit_urb();
+ 1) ! 420.584 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 778.166 us  |    }
+ 0) ! 829.500 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   5.833 us    |    uvc_queue_buffer_release();
+ 1) + 78.750 us   |    uvc_submit_urb();
+ 1) ! 414.750 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 776.709 us  |    }
+ 0) ! 827.750 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 74.959 us   |    uvc_submit_urb();
+ 1) ! 409.792 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 776.708 us  |    }
+ 0) ! 828.041 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   6.125 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 75.250 us   |    uvc_submit_urb();
+ 1) ! 424.667 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 12.542 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 777.292 us  |    }
+ 0) ! 828.042 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1) + 74.958 us   |    uvc_submit_urb();
+ 1) ! 410.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 777.583 us  |    }
+ 0) ! 828.041 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   6.125 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 79.917 us   |    uvc_submit_urb();
+ 1) ! 420.291 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 777.000 us  |    }
+ 0) ! 828.333 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 74.666 us   |    uvc_submit_urb();
+ 1) ! 419.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.291 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) ! 774.959 us  |    }
+ 0) ! 825.708 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   5.541 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 75.833 us   |    uvc_submit_urb();
+ 1) ! 415.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 11.959 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 777.291 us  |    }
+ 0) ! 828.917 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 75.250 us   |    uvc_submit_urb();
+ 1) ! 408.625 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.875 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 775.834 us  |    }
+ 0) ! 827.167 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 81.083 us   |    uvc_submit_urb();
+ 1) ! 425.542 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.791 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 777.000 us  |    }
+ 0) ! 828.916 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   5.833 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 72.917 us   |    uvc_submit_urb();
+ 1) ! 413.583 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.000 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 776.125 us  |    }
+ 0) ! 827.167 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 72.916 us   |    uvc_submit_urb();
+ 1) ! 408.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.708 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.791 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 11.375 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 777.291 us  |    }
+ 0) ! 828.333 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   5.834 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 72.917 us   |    uvc_submit_urb();
+ 1) ! 415.916 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.584 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   5.250 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.791 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   5.541 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 777.291 us  |    }
+ 0) ! 828.625 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1) + 79.333 us   |    uvc_submit_urb();
+ 1) ! 422.625 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   5.250 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 777.000 us  |    }
+ 0) ! 828.333 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   6.125 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 73.500 us   |    uvc_submit_urb();
+ 1) ! 415.917 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) ! 777.000 us  |    }
+ 0) ! 828.334 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 73.500 us   |    uvc_submit_urb();
+ 1) ! 408.917 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 11.666 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 778.167 us  |    }
+ 0) ! 829.500 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   6.416 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 73.500 us   |    uvc_submit_urb();
+ 1) ! 419.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) ! 774.667 us  |    }
+ 0) ! 826.291 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   5.834 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 79.334 us   |    uvc_submit_urb();
+ 1) ! 415.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.583 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 776.708 us  |    }
+ 0) ! 828.041 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 75.541 us   |    uvc_submit_urb();
+ 1) ! 410.375 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 778.750 us  |    }
+ 0) ! 829.791 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   5.833 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1) + 74.958 us   |    uvc_submit_urb();
+ 1) ! 425.250 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.292 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   5.250 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.792 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.375 us    |      uvc_video_decode_end();
+ 0)               |      uvc_video_next_buffers() {
+ 0)   7.000 us    |        uvc_queue_next_buffer();
+ 0) + 14.583 us   |      }
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) ! 779.333 us  |    }
+ 0) ! 830.666 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)               |    uvc_queue_buffer_release() {
+ 1)               |      uvc_queue_buffer_complete() {
+ 1) + 19.541 us   |        vb2_buffer_done();
+ 1) + 28.292 us   |      }
+ 1) + 36.458 us   |    }
+ 1) + 75.250 us   |    uvc_submit_urb();
+ 1) ! 421.458 us  |  }
+ 2) + 11.667 us   |              vb2_ops_wait_finish();
+ 2)               |              uvc_buffer_finish() {
+ 2)   4.375 us    |                uvc_video_clock_update();
+ 2) + 12.833 us   |              }
+ 2)               |              __fill_v4l2_buffer() {
+ 2)               |                vb2_buffer_in_use() {
+ 2)   4.084 us    |                  vb2_vmalloc_num_users();
+ 2) + 12.541 us   |                }
+ 2) + 21.583 us   |              }
+ 2)   4.375 us    |              __init_vb2_v4l2_buffer();
+ 2) $ 1169124 us  |            }
+ 2) $ 1169133 us  |          }
+ 2) $ 1169144 us  |        }
+ 2) $ 1169152 us  |      }
+ 2) $ 1169162 us  |    }
+ 2) $ 1169184 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   8.167 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   6.709 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0) ! 252.875 us  |    }
+ 0) + 77.292 us   |    uvc_submit_urb();
+ 0) ! 382.083 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.875 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0) ! 249.958 us  |    }
+ 0) + 73.500 us   |    uvc_submit_urb();
+ 0) ! 373.333 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   8.167 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0) + 16.625 us   |      uvc_video_decode_start();
+ 0)   4.666 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 394.625 us  |    }
+ 0) ! 463.750 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 88.959 us   |    uvc_submit_urb();
+ 1) ! 183.750 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   8.167 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.416 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   7.875 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 11.667 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 784.292 us  |    }
+ 0) ! 853.125 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   6.417 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 86.625 us   |    uvc_submit_urb();
+ 1) ! 428.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.875 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.416 us    |      uvc_video_decode_start();
+ 0)   4.666 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 11.667 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   7.292 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) ! 783.708 us  |    }
+ 0) ! 852.542 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.959 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   6.416 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1) + 86.334 us   |    uvc_submit_urb();
+ 1) ! 426.417 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.875 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.416 us    |      uvc_video_decode_start();
+ 0)   4.667 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 11.666 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   7.583 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 783.417 us  |    }
+ 0) ! 853.125 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.666 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 85.750 us   |    uvc_submit_urb();
+ 1) ! 421.167 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   8.167 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   4.667 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   7.875 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 11.667 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 783.125 us  |    }
+ 0) ! 851.375 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.958 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   6.708 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 84.292 us   |    uvc_submit_urb();
+ 1) ! 427.875 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.875 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.667 us    |      uvc_video_decode_data();
+ 0)   4.375 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 11.666 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   7.875 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) ! 781.959 us  |    }
+ 0) ! 851.959 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.958 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 84.875 us   |    uvc_submit_urb();
+ 1) ! 427.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.875 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.667 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 11.667 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.500 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   7.584 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0) ! 783.125 us  |    }
+ 0) ! 851.666 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.958 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   6.125 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 89.541 us   |    uvc_submit_urb();
+ 1) ! 426.125 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   8.167 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.416 us    |      uvc_video_decode_start();
+ 0)   4.666 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 15.166 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 784.583 us  |    }
+ 0) ! 855.166 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.959 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 85.458 us   |    uvc_submit_urb();
+ 1) ! 423.500 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   7.875 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.417 us    |      uvc_video_decode_start();
+ 0)   4.667 us    |      uvc_video_decode_data();
+ 0)   4.375 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.666 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 11.375 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   7.875 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   9.917 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.084 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.083 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   9.916 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   5.542 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) ! 782.833 us  |    }
+ 0) ! 853.416 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.667 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   6.125 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   3.791 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1) + 84.583 us   |    uvc_submit_urb();
+ 1) ! 434.583 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   8.167 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   6.416 us    |      uvc_video_decode_start();
+ 0)   4.375 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 11.958 us   |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   7.292 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0) + 10.209 us   |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.667 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.791 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) + 10.208 us   |      uvc_video_decode_start();
+ 0)   3.791 us    |      uvc_video_decode_data();
+ 0)   4.084 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.084 us    |      uvc_video_decode_data();
+ 0)   4.083 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   4.083 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   3.792 us    |      uvc_video_decode_data();
+ 0)   3.792 us    |      uvc_video_decode_end();
+ 0) ! 781.667 us  |    }
+ 0) ! 850.792 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.084 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   7.000 us    |    uvc_queue_buffer_release();
+ 1)   4.375 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1) + 85.459 us   |    uvc_submit_urb();
+ 1) ! 425.541 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   5.250 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   2.917 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.041 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   7.583 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   5.250 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.917 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.041 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   3.792 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0) ! 457.042 us  |    }
+ 0) ! 507.791 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1) + 63.583 us   |    uvc_submit_urb();
+ 1) ! 275.041 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.958 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   2.917 us    |      uvc_video_decode_data();
+ 0)   2.625 us    |      uvc_video_decode_end();
+ 0)   2.917 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   7.000 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   8.750 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_data();
+ 0)   2.041 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0) ! 457.333 us  |    }
+ 0) ! 511.292 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   2.916 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   3.792 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1) + 61.250 us   |    uvc_submit_urb();
+ 1) ! 287.000 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.958 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   2.917 us    |      uvc_video_decode_data();
+ 0)   2.625 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_data();
+ 0)   2.041 us    |      uvc_video_decode_end();
+ 0)   7.291 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.041 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   6.125 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   4.959 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   2.041 us    |      uvc_video_decode_data();
+ 0)   2.041 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0) ! 456.167 us  |    }
+ 0) ! 508.083 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1) + 63.000 us   |    uvc_submit_urb();
+ 1) ! 276.792 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.667 us    |    uvc_queue_get_current_buffer();
+ 0)               |    uvc_video_decode_isoc() {
+ 0)   4.375 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_data();
+ 0)   2.625 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.041 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   7.000 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   4.958 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.041 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   5.834 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.333 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.042 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.625 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.041 us    |      uvc_video_decode_end();
+ 0)   3.208 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.042 us    |      uvc_video_decode_end();
+ 0)   2.334 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   5.833 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.333 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0)   2.917 us    |      uvc_video_decode_start();
+ 0)   2.333 us    |      uvc_video_decode_data();
+ 0)   2.041 us    |      uvc_video_decode_end();
+ 0)   2.625 us    |      uvc_video_decode_start();
+ 0)   2.334 us    |      uvc_video_decode_data();
+ 0)   2.334 us    |      uvc_video_decode_end();
+ 0) ! 455.583 us  |    }
+ 0) ! 495.541 us  |  }
+ 1)               |  uvc_video_copy_data_work() {
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   4.083 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 2)               |  v4l2_ioctl() {
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 2)   3.208 us    |    v4l2_prio_check();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 2)               |    v4l_streamoff() {
+ 1)   2.042 us    |    uvc_queue_buffer_release();
+ 2)               |      uvc_ioctl_streamoff() {
+ 2)               |        uvc_queue_streamoff() {
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 2)               |          vb2_streamoff() {
+ 2)               |            vb2_core_streamoff() {
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 2)               |              __vb2_queue_cancel() {
+ 2)               |                uvc_stop_streaming() {
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 2)               |                  uvc_video_stop_streaming() {
+ 2)               |                    uvc_video_stop_transfer() {
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.625 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.334 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1)   2.333 us    |    uvc_queue_buffer_release();
+ 1) + 58.042 us   |    uvc_submit_urb();
+ 1) ! 269.791 us  |  }
+ 0)               |  uvc_video_complete() {
+ 0)               |    uvc_queue_cancel() {
+ 0)   3.792 us    |      vb2_buffer_done();
+ 0)   2.333 us    |      vb2_buffer_done();
+ 0) + 13.125 us   |    }
+ 0)   4.084 us    |    uvc_queue_cancel();
+ 0) + 25.666 us   |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.375 us    |    uvc_queue_cancel();
+ 0)   3.791 us    |    uvc_queue_cancel();
+ 0) + 16.334 us   |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.083 us    |    uvc_queue_cancel();
+ 0)   3.792 us    |    uvc_queue_cancel();
+ 0) + 16.333 us   |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.083 us    |    uvc_queue_cancel();
+ 0)   3.792 us    |    uvc_queue_cancel();
+ 0) + 16.042 us   |  }
+ 0)               |  uvc_video_complete() {
+ 0)   4.084 us    |    uvc_queue_cancel();
+ 0)   4.083 us    |    uvc_queue_cancel();
+ 0) + 16.625 us   |  }
+ 2) ! 107.041 us  |                      uvc_free_urb_buffers();
+ 2) # 1096.083 us |                    }
+ 2) # 3976.292 us |                  }
+ 2) # 3998.459 us |                }
+ 2)   8.166 us    |                uvc_buffer_finish();
+ 2)   4.375 us    |                __init_vb2_v4l2_buffer();
+ 2)   4.084 us    |                uvc_buffer_finish();
+ 2)   4.083 us    |                __init_vb2_v4l2_buffer();
+ 2) # 4050.666 us |              }
+ 2) # 4057.375 us |            }
+ 2) # 4064.083 us |          }
+ 2) # 4072.541 us |        }
+ 2) # 4081.583 us |      }
+ 2) # 4088.292 us |    }
+ 2) # 4112.208 us |  }
+ 2)               |  vb2_common_vm_close() {
+ 2)   4.666 us    |    vb2_vmalloc_put();
+ 2) + 17.208 us   |  }
+ 2)               |  vb2_common_vm_close() {
+ 2)   4.666 us    |    vb2_vmalloc_put();
+ 2) + 15.167 us   |  }
+ 2)               |  vb2_common_vm_close() {
+ 2)   4.083 us    |    vb2_vmalloc_put();
+ 2) + 14.000 us   |  }
+ 2)               |  v4l2_release() {
+ 2)               |    uvc_v4l2_release() {
+ 2)   7.875 us    |      uvc_ctrl_cleanup_fh();
+ 2)               |      uvc_queue_release() {
+ 2)               |        vb2_queue_release() {
+ 2)               |          vb2_core_queue_release() {
+ 2)   4.667 us    |            __vb2_cleanup_fileio();
+ 2)   9.916 us    |            __vb2_queue_cancel();
+ 2)               |            __vb2_queue_free() {
+ 2)               |              __vb2_buf_mem_free() {
+ 2) # 1939.583 us |                vb2_vmalloc_put();
+ 2) # 1948.917 us |              }
+ 2)               |              __vb2_buf_mem_free() {
+ 2) # 1935.208 us |                vb2_vmalloc_put();
+ 2) # 1947.458 us |              }
+ 2)               |              __vb2_buf_mem_free() {
+ 2) # 2583.875 us |                vb2_vmalloc_put();
+ 2) # 2597.875 us |              }
+ 2) # 6514.958 us |            }
+ 2) # 6547.625 us |          }
+ 2) # 6555.792 us |        }
+ 2) # 6566.000 us |      }
+ 2)   5.834 us    |      uvc_dismiss_privileges();
+ 2)               |      v4l2_fh_del() {
+ 2)   4.667 us    |        v4l2_prio_close();
+ 2) + 16.042 us   |      }
+ 2)               |      v4l2_fh_exit() {
+ 2)   7.584 us    |        v4l_disable_media_source();
+ 2)   7.292 us    |        v4l2_event_unsubscribe_all();
+ 2) + 28.000 us   |      }
+ 2) ! 262.208 us  |      uvc_status_stop();
+ 0)   8.750 us    |  uvc_status_complete();
+ 2) # 6954.209 us |    }
+ 2) # 6966.750 us |  }
+ ------------------------------------------
+ 2) v4l2-ca-100466 =>   kworker-34  
+ ------------------------------------------
+
+ 2)               |  uvc_suspend() {
+ 2)   5.250 us    |    uvc_video_suspend();
+ 2) + 28.000 us   |  }
+ 2)   6.708 us    |  uvc_suspend();
+
+
+**驱动调用链（从 trace.log 提取）**：
+
+```
+open → uvc_v4l2_open → uvc_resume + v4l2_fh_init
+
+S_FMT → uvc_ioctl_s_fmt_vid_cap → uvc_probe_video
+                                    → uvc_set_video_ctrl (USB 控制传输 OUT)
+                                    → uvc_get_video_ctrl (USB 控制传输 IN)
+                                    → uvc_set_video_ctrl
+                                    → uvc_get_video_ctrl
+
+REQBUFS → vb2_core_reqbufs → vb2_vmalloc_alloc × 3
+
+STREAMON → uvc_start_streaming
+           → uvc_video_start_streaming
+             → uvc_set_video_ctrl
+             → uvc_video_start_transfer
+               → uvc_find_endpoint × 8
+               → uvc_alloc_urb_buffers (~2.9ms)
+               → uvc_submit_urb × 5 (~70us each)
+
+DQBUF → v4l_dqbuf → uvc_ioctl_dqbuf → vb2_core_dqbuf
+```
+
+### 4.5 关键发现
+
+1. **最耗时的 ioctl 是 STREAMON（~7ms）**，不是因为 USB 传输慢，而是 `uvc_alloc_urb_buffers` 分配 URB buffer 耗时 ~2.9ms
+wall-clock 时间最长的是 v4l2_open（89ms），但其中绝大部分是调度等待。真正的干活时间，STREAMON（7ms）才是最耗时的 ioctl。
+2. **REQBUFS 第二耗时（~4.5ms）**，`vb2_vmalloc_alloc` 分配 3 块 4MB 缓冲区用了 3 次 ~1.5ms 的 vmalloc
+3. **S_FMT 的 ~1.1ms** 中，大部分是 USB 控制传输（`set_video_ctrl` / `get_video_ctrl`）的 USB 总线往返延迟
+4. **UCV 提交了 5 个 URB**，这是 UVC 驱动的默认 ping-pong buffer 设计，保证在 USB 传输完成中断到来前有 buffer 可用
+
+### 4.6 思考题
+
+1. `vb2_core_dqbuf` 返回用户态时，数据经历了哪些内存拷贝？
+根据 ftrace 数据：
+申请阶段：vb2_core_reqbufs → vb2_vmalloc_alloc  (分配 3 个 4MB buffer)
+采集阶段：usb_submit_urb → URB 完成 → uvc_video_complete
+           → uvc_video_decode_isoc → uvc_video_decode_start
+内存拷贝路径：
+USB 相机 → [URB buffer] ──memcpy──→ [vb2 vmalloc buffer] ──mmap 直读──→ 用户态
+              ^                       ^                         ^
+         硬件 DMA                 1 次拷贝                 零拷贝（mmap）
+关键点：
+- 只有 1 次拷贝：从 URB buffer → vb2 buffer
+- mmap 后用户态读是零拷贝，因为 vb2_vmalloc_alloc 分配的内核内存通过页表直接映射到用户空间
+- 这块跟 ISP 驱动的 dma-buf 方案不同——ISP 用硬件 DMA 直接把 sensor 数据写入 vb2 buffer，连那 1 次拷贝都省了（真正的零拷贝）
+2. UVC 驱动 vs ISP 驱动，`vb2` 框架的使用方式有哪些不同？
+从 ftrace 数据能看出来的关键差异：
+维度	UVC (uvcvideo)	ISP (rkisp1)
+buffer 分配	vb2_vmalloc_alloc（内核虚拟内存）	dma_alloc_coherent（DMA 连续内存）
+数据来源	USB URB 中断 → 一次 memcpy	硬件 DMA 直接写入 vb2 buffer
+拷贝次数	1 次（URB → vb2 buffer）	0 次（sensor DMA 直写）
+queue_setup	uvc_queue_setup 创建 vmalloc buffer	rkisp_queue_setup 创建 dma-buf
+start_streaming	提交 5 个 URB 到 USB 子系统	配置 DMA 引擎 + sensor 时钟
+核心结论：UVC 多了一次 URB 到 vb2 buffer 的拷贝，ISP 硬件 DMA 直接写入 buffer 零拷贝。 这也是为什么 ISP 方案在性能上碾压 UVC，但开发复杂度也高得多——你要写 DMA 引擎配置、中断处理、时钟管理等。
+3. `usb_submit_urb` 是什么？为什么 UVC 驱动需要它？
+从 ftrace 数据看，uvc_submit_urb 调用了 5 次，每次 ~70us。
+usb_submit_urb 是向 USB 主机控制器提交一个数据传输请求。
+为什么 UVC 需要它：
+- USB 是主机驱动的总线，设备不能主动发数据。必须由主机先提交一个 URB（USB Request Block），设备端才能把视频数据发过来。
+- UVC 驱动提交了 5 个 URB，形成环形缓冲区。当一个 URB 传完，中断处理函数 uvc_video_complete 把数据搬到 vb2 buffer，然后立即重新提交这个 URB（uvc_submit_urb），保证流水线不断。
+- 这也是为什么 ftrace 里看到 5 个 URB 在不停地 complete → submit → complete → submit。
+换成 ISP 的话没有 USB 层，也就不需要 URB。DMA 引擎配置好后就自动把 sensor 数据写入内存，走的是硬件传输，不需要逐包提交和中断。
+YUYV（raw） vs MJPG（压缩）：
+维度	YUYV	MJPG
+帧大小	固定 4,147,200 bytes	变化，取决于画面复杂度
+解码依赖	无需解码，直接读	需要 libjpeg 解压成 raw 才能处理
+带宽	高（USB 2.0 480Mbps 大约跑 30fps 满）	低，同样带宽能跑更高帧率或分辨率
+CPU 负载	低，只做 memcpy	高，每帧要 JPEG 解码
+驱动处理	uvc_video_decode_isoc 中直接拷贝	同样走 URB + 拷贝，但数据量小很多
+V4L2 应用层	不改代码，只改 pixelformat	不改代码，但读到的数据是 JPEG 不是 raw
+你实测抓到 YUYV 是 4,147,200 bytes，如果换成 MJPG 可能只有 50~200KB。处理前要先解压
+
+---
+
+## 五、实验 3：用 Dynamic Debug 看 UVC 驱动日志
+
+### 5.1 操作步骤
+
+```bash
+# 查看 uvcvideo 驱动的调试点
+sudo cat /sys/kernel/debug/dynamic_debug/control | grep uvc
+
+# 打开所有 uvcvideo 调试输出
+echo 'module uvcvideo +p' > /sys/kernel/debug/dynamic_debug/control
+
+# 清 dmesg，运行程序
+sudo dmesg -C
+sudo /tmp/v4l2-capture
+dmesg | tail -50 | tee /tmp/uvc_debug.log
+
+# 关闭调试
+echo 'module uvcvideo -p' > /sys/kernel/debug/dynamic_debug/control
+```
+
+### 5.2 实测结果
+
+```bash
+# uvcvideo 驱动仅有 1 个动态调试点
+sudo cat /sys/kernel/debug/dynamic_debug/control | grep uvc
+# → drivers/media/usb/uvc/uvc_ctrl.c:2293 uvc_ctrl_restore_values（系统恢复时触发）
+
+# 打开所有 uvcvideo 调试后运行抓帧程序，dmesg 无输出
+sudo modinfo uvcvideo | grep dyndbg  # 无输出，模块未编译 dyndbg
+
+# 结论：当前内核的 uvcvideo 模块未编译 dynamic debug 支持，
+# 对 UVC 驱动来说 Dynamic Debug 效果有限，更适合用 Ftrace 追踪
+```
+
+### 5.3 观察重点
+
+- Dynamic Debug 只对调用了 `pr_debug()` / `dev_dbg()` 的代码路径有效
+- UVC 驱动的核心路径（uvc_probe_video、uvc_submit_urb 等）使用 `v4l2_dbg()` 宏，不是 dyndbg 机制
+- 验证方法：`modinfo <module> | grep dyndbg` 可检查模块是否编译了 dyndbg
+
+---
+
+## 六、思考题
+
+1. V4L2 的 buffer 生命周期（QBUF → DQBUF）在 UVC 驱动中如何映射到 USB URB 的提交和完成？
+
+   QBUF 阶段（ftrace 数据）：`v4l_qbuf → uvc_ioctl_qbuf → uvc_queue_buffer → vb2_qbuf → vb2_core_qbuf`。buffer 被放入 vb2 队列并由 `uvc_buffer_prepare` 准备，但此时并**不提交 URB**——只是让驱动知道有 buffer 可用。
+
+   STREAMON 阶段（真正触发 USB 传输）：`v4l_streamon → uvc_ioctl_streamon → uvc_queue_streamon → vb2_core_streamon → uvc_start_streaming → uvc_video_start_transfer`。在此提交 5 个 URB（`uvc_submit_urb` ×5），形成环形流水线。
+
+   URB 完成 → DQBUF：USB 数据到达后触发中断 → `uvc_video_complete` → `uvc_video_decode_isoc` → `uvc_video_decode_start`（将 URB buffer 数据拷贝到当前 vb2 buffer）。当一个完整帧组装完毕，该 vb2 buffer 标记为 done，用户态 `DQBUF` 即可取走。URB 立即被 `uvc_submit_urb` 重新提交以保证流水线不断。
+
+   一句话：**QBUF 准备 buffer 槽位，STREAMON 提交 URB 启动传输，URB complete 填充 buffer，DQBUF 取走已完成帧**。
+
+2. `mmap` 方式映射的 buffer 物理内存是谁分配的？应用层和驱动层如何共享？
+
+   分配方：**内核 vmalloc**。从 ftrace 看到 `vb2_core_reqbufs → __vb2_queue_alloc → vb2_vmalloc_alloc`，3 个 buffer 各占 ~4MB，通过 `vmalloc` 分配内核虚拟地址连续（但物理页不连续）的内存。
+
+   共享机制（mmap 路径）：`v4l2_mmap → uvc_v4l2_mmap → uvc_queue_mmap → vb2_mmap → vb2_vmalloc_mmap → vb2_common_vm_open`。vb2_vmalloc 模块将 vmalloc 分配的 pages 通过 remap_vmalloc_range 映射到用户进程的页表，使用户态虚拟地址直接指向同一组物理页面。
+
+   **关键结论**：物理页面由内核 vmalloc 分配，mmap 时建立用户态页表映射指向相同物理页面。用户态读写没有额外的内存拷贝（零拷贝）。这不同于 ISP 的 dma-buf 方案——ISP 用 `dma_alloc_coherent` 分配物理连续内存，硬件 DMA 直接写入。
+
+3. Ftrace 追踪到的调用链中，哪个 ioctl 最耗时？为什么？
+
+   **STREAMON（~7ms）最耗时**，详见 §4.5 分析。其中 `uvc_alloc_urb_buffers` 占 ~3.4ms（分配 5 个 URB 的 isochronous packet buffer），`uvc_submit_urb` ×5 占 ~350ms（每次 ~70ms），`uvc_set_video_ctrl` 占 ~0.3ms（USB 控制传输协商参数）。
+
+   按 ioctl 耗时排序：
+   | ioctl | 耗时 | 瓶颈 |
+   |-------|------|------|
+   | STREAMON | ~6.9ms | uvc_alloc_urb_buffers（~3.4ms）+ 5×uvc_submit_urb |
+   | REQBUFS | ~4.5ms | 3×vb2_vmalloc_alloc（每次 ~1.5ms） |
+   | S_FMT | ~1.2ms | USB 控制传输往返（set/get_video_ctrl ×4） |
+   | mmap（3次） | ~0.9ms each | remap_vmalloc_range 页表建立 |
+   | QBUF（3次） | ~65ms each | 纯软件入队，几乎无开销 |
+   | DQBUF | 取决于帧到达 | 等待 URB complete 中断 |
+
+   注意若算 wall-clock，`open()` 的 89ms 最长，但其中 ~88ms 是调度等待而非实际干活。**纯 ioctl 执行时间中 STREAMON 是冠军**。
+
+4. 如果把 YUYV 换成 MJPG，V4L2 接口的行为会有什么不同？
+   YUYV（raw） vs MJPG（压缩）：
+   维度	YUYV	MJPG
+   帧大小	固定 4,147,200 bytes	变化，取决于画面复杂度
+   解码依赖	无需解码，直接读	需要 libjpeg 解压成 raw 才能处理
+   带宽	高（USB 2.0 480Mbps 大约跑 30fps 满）	低，同样带宽能跑更高帧率或分辨率
+   CPU 负载	低，只做 memcpy	高，每帧要 JPEG 解码
+   驱动处理	uvc_video_decode_isoc 中直接拷贝	同样走 URB + 拷贝，但数据量小很多
+   V4L2 应用层	不改代码，只改 pixelformat	不改代码，但读到的数据是 JPEG 不是 raw
+   你实测抓到 YUYV 是 4,147,200 bytes，如果换成 MJPG 可能只有 50~200KB。处理前要先解压
+
+5. UVC 相机换回 MIPI ISP 相机时，应用层代码要改哪些部分？
+
+   应用层需要改动以下方面：
+
+   | 维度 | UVC | MIPI ISP (RK) |
+   |------|-----|---------------|
+   | 设备发现 | `/dev/video1` 固定节点 | 需用 `media-ctl -p` 遍历拓扑找到 capture 节点 |
+   | 像素格式 | YUYV / MJPG | RAW → NV12（需 ISP 处理），通常用 V4L2_PIX_FMT_NV12 |
+   | 分辨率限制 | 相机报告的支持列表 | sensor + ISP 组合决定，需查 sensor datasheet |
+   | 管线配置 | 即插即用，无需配置 | 必须用 `media-ctl` 设置链路：`sensor → csi → rkisp1 → /dev/videoX` |
+   | 子设备控制 | 无需 | 需通过 subdev ioctl 设置 sensor 参数（曝光、增益、帧率） |
+   | 3A 算法 | 摄像头固件自动处理 | 需集成 RKAIQ 库（AE / AWB / AF）或手动写 v4l2-subdev 控制 |
+   | buffer 类型 | mmap（vb2_vmalloc） | 建议 dmabuf 实现零拷贝（vb2_dc contig alloc） |
+   | Metadata 通道 | /dev/video2 可选 | 有 /dev/videoX 的 ISP statistics 通道 |
+
+   核心改动量：**需新增 media-ctl 配置 + subdev 初始化 + RKAIQ 集成**。纯帧采集逻辑（S_FMT → REQBUFS → QBUF → STREAMON → DQBUF）可复用，但前面的管线准备代码完全不同。
+
+---
+
+## 七、踩坑记录
+
+| 日期 | 问题 | 原因 | 解决方案 |
+|------|------|------|----------|
+| 2026-06-17 | /dev/video0 不是 UVC 设备 | 需要确认哪个节点是 USB 相机 | 通过 dmesg 和 v4l2-ctl --list-devices 确认 |
+| 2026-06-17 | S_FMT 设 NV12 但实际变成 MJPG | UVC 相机不支持 NV12，驱动自动降级 | 先用 `--list-formats-ext` 确认支持的格式，改用 YUYV |
+| 2026-06-17 | `sudo echo xxx > /sys/kernel/tracing/xxx` 报 Permission denied | `>` 重定向由 shell 执行，不受 sudo 控制 | `echo xxx \| sudo tee /sys/...` |
+| 2026-06-17 | `set_ftrace_filter` 报 Invalid argument | glob pattern 不匹配任何函数 | 先 `cat available_filter_functions \| grep xxx` 确认 |
+| 2026-06-17 | Dynamic Debug 打开 uvcvideo 后 dmesg 无输出 | 模块未编译 dyndbg 支持 | `modinfo uvcvideo \| grep dyndbg` 检查 |
+
+---
+
+## 八、下阶段预告
+
+阶段三：**硬件编解码 + MPP**
+- 用 RV1126B 的 MPP 硬件编码器把 YUYV 转 H.264
+- RGA 2D 硬件加速
+- 对比 CPU 编码 vs 硬件编码的性能差
+
+---
+
+## 相关笔记
+
+- [[kernel-debug-env]] — 内核 Debug 环境搭建
+- [[rv1126b]] — RV1126B 运动相机项目
+- [[MOC-嵌入式Linux]] — 嵌入式 Linux 学习地图
