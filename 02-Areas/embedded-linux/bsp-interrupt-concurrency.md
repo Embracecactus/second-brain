@@ -896,4 +896,8 @@ static void correct_handler(struct work_struct *work)
 - [[MOC-嵌入式Linux]] — 学习路线总览
 - [[bsp-boot-flow]] — 阶段一：Bootloader + 启动流程
 - [[bsp-device-model-dtb]] — 阶段二：设备模型 + 设备树
+- [[bsp-interrupt-irqdomain-deep]] — IRQ Domain 源码深挖
+- [[bsp-interrupt-gic-deep]] — GIC-400 驱动源码深挖
+- [[bsp-interrupt-fullpath-deep]] — 中断处理完整路径
+- [[bsp-lockdep-deep]] — Lockdep 原理与源码
 - [[kernel-debug-env]] — 附录A：内核调试环境 (Ftrace / Lockdep 使用)
