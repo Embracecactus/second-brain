@@ -232,6 +232,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - [[bsp-interrupt-concurrency]] — 阶段三
 - [[bsp-interrupt-irqdomain-deep]] — IRQ Domain 源码深挖 (阶段三深度)
 - [[bsp-interrupt-gic-deep]] — GIC-400 驱动源码深挖 (阶段三深度)
+- [[bsp-interrupt-fullpath-deep]] — 中断处理完整路径 (阶段三深度)
 - [[bsp-peripheral-drivers]] — 阶段四
 - [[bsp-power-management]] — 阶段五
 - [[bsp-capstone-driver]] — 阶段六
