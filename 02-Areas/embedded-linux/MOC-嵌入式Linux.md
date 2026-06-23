@@ -226,6 +226,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - [[bsp-uboot-amp]] — AMP Boot 详解 (阶段一异构)
 - [[bsp-device-model-dtb]] — 阶段二
 - [[bsp-device-model-platform-bus-deep]] — Platform Bus 源码追溯 (阶段二深度)
+- [[bsp-device-model-probe-deep]] — Driver Probe 全路径源码追溯 (阶段二深度)
 - [[bsp-interrupt-concurrency]] — 阶段三
 - [[bsp-peripheral-drivers]] — 阶段四
 - [[bsp-power-management]] — 阶段五
