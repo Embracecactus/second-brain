@@ -471,29 +471,65 @@ conf {
 SPL 验签时检查 `rollback-index`：
 
 ```c
-// spl_fit.c:770-785
-static int spl_fit_rollback_index(struct spl_fit_info *ctx, int node)
-{
-    int ret;
-    u32 index;
-    
-    ret = fdtdec_get_int(ctx->fit, node, "rollback-index", -1);
-    if (ret < 0)
-        return 0;  // 无 rollback-index 配置，跳过
-    
-    index = read_rollback_index_from_storage();  // 从 RPMB/OTP 读取
+// common/spl/spl_fit.c:766-781 — ★ 真实代码
+#ifdef CONFIG_SPL_FIT_ROLLBACK_PROTECT
+    uint32_t this_index, min_index;
 
-    if ((u32)ret < index) {
-        printf("fit reject rollback: %d < %d(min)\n", ret, index);
-        return -EPERM;  // ❌ 固件过旧
+    ret = fit_rollback_index_verify(fit, FIT_ROLLBACK_INDEX_SPL,
+                                    &this_index, &min_index);
+    if (ret) {
+        printf("fit failed to get rollback index, ret=%d\n", ret);
+        return ret;
+    } else if (this_index < min_index) {
+        printf("fit reject rollback: %d < %d(min)\n",
+               this_index, min_index);
+        return -EINVAL;
     }
-    
-    // 更新存储中的版本号
-    write_rollback_index_to_storage(ret);
-    printf("rollback index: %d >= %d(min), OK\n", ret, index);
+
+    printf("rollback index: %d >= %d(min), OK\n", this_index, min_index);
+#endif
+```
+
+其中 `fit_rollback_index_verify()` 在 Rockchip 平台覆写了 weak 函数：
+
+```c
+// arch/arm/mach-rockchip/fit_misc.c:211-238
+int fit_rollback_index_verify(const void *fit, uint32_t rollback_fd,
+                              uint32_t *fit_index, uint32_t *otp_index)
+{
+    int conf_noffset, ret;
+
+    conf_noffset = fit_conf_get_node(fit, NULL);
+    if (conf_noffset < 0)
+        return conf_noffset;
+
+    ret = fit_image_get_rollback_index(fit, conf_noffset, fit_index);
+    if (ret) {
+        printf("Failed to get rollback-index from FIT, ret=%d\n", ret);
+        return ret;
+    }
+
+    ret = fit_read_otp_rollback_index(*fit_index, otp_index);
+    if (ret) {
+        printf("Failed to get rollback-index from otp, ret=%d\n", ret);
+        return ret;
+    }
+
+    /* 如果 FIT 中的版本更高, 在下次重启时写入 OTP */
+    if (*otp_index < *fit_index)
+        gd->rollback_index = *fit_index;
+
     return 0;
 }
 ```
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| `fit_conf_get_node` | 获取默认 configuration 节点 | 对应 FIT 中 `configurations/conf` |
+| `fit_image_get_rollback_index` | 从 FIT 节点读取 `rollback-index` 属性值 | DTB 中存储的固件版本号 |
+| `fit_read_otp_rollback_index` | 从 OTP 读取最小允许版本号 | 硬件防篡改存储 |
+| 比较 | `fit_index < otp_index` → 拒绝 | 禁止降级 |
+| `gd->rollback_index` | 延迟写入标志 | SPL 重启时写入 OTP |
 
 ### 7.3 存储 rollback-index 的安全性
 
