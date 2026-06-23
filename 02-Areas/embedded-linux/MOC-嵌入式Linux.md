@@ -215,6 +215,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - [[bsp-boot-flow]] — 阶段一
 - [[bsp-spl-fit]] — SPL FIT 解析与验证 (阶段一深度)
 - [[bsp-uboot-adaptation]] — U-Boot 板级适配与启动流程 (阶段一移植)
+- [[bsp-uboot-secureboot]] — U-Boot 安全启动 & FIT 签名深度解析 (阶段一安全)
 - [[bsp-device-model-dtb]] — 阶段二
 - [[bsp-interrupt-concurrency]] — 阶段三
 - [[bsp-peripheral-drivers]] — 阶段四
