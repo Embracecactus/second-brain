@@ -142,34 +142,113 @@ U-Boot board_init_r() → board_late_init()
 ### 3.2 关键函数 `amp_cpus_on()`
 
 ```c
-// drivers/cpu/rockchip_amp.c
+// drivers/cpu/rockchip_amp.c — 从 amp 分区加载 AMP 固件
 int amp_cpus_on(void)
 {
-    // 1. 检测 DTS 中是否启用了 AMP
-    //    /rockchip-amp { status = "okay"; };
+    struct blk_desc *dev_desc;
+    bootm_headers_t images;
+    disk_partition_t part;
+    void *hdr, *fit;
+    int offset, cnt;
+    int totalsize;
+    int ret = 0;
 
-    // 2. 从 amp 分区加载 FIT 镜像
-    bootm_find_images();              // 定位 amp 分区
-    fit_get_data(amp_fit, "hpmcu");   // 提取 rtt.bin 数据
+    // 1. 获取块设备 (eMMC/SD)
+    dev_desc = rockchip_get_bootdev();
+    if (!dev_desc)
+        return -EIO;
 
-    // 3. 将 MCU 固件复制到指定地址
-    memcpy((void *)0x48c02000, rtt_bin, rtt_size);
+    // 2. 查找 amp 分区信息
+    if (part_get_info_by_name(dev_desc, AMP_PART, &part) < 0)
+        return -ENODEV;
 
-    // 4. 初始化共享内存
-    memset((void *)rpmsg_base, 0, rpmsg_size);
+    // 3. 读取 FIT 头部 (前 FIT_HEADER_SIZE 字节)
+    hdr = memalign(ARCH_DMA_MINALIGN, FIT_HEADER_SIZE);
+    if (!hdr)
+        return -ENOMEM;
 
-    // 5. 配置 GIC: SPI 中断路由到 MCU
-    gicd_writel(..., GICD_ISENABLER);
+    offset = part.start;
+    cnt = DIV_ROUND_UP(FIT_HEADER_SIZE, part.blksz);
+    if (blk_dread(dev_desc, offset, cnt, hdr) != cnt) {
+        ret = -EIO;
+        goto out2;
+    }
 
-    // 6. 释放 MCU 复位
-    writel(0, MCU_RST_CTRL);          // 释放 RISC-V 核
+    // 4. 验证 FIT 格式 + 获取镜像总大小
+    if (fdt_check_header(hdr)) {
+        AMP_E("Not fit\n");
+        ret = -EINVAL;
+        goto out2;
+    }
+    if (fit_get_totalsize(hdr, &totalsize)) {
+        AMP_E("No totalsize\n");
+        ret = -EINVAL;
+        goto out2;
+    }
 
-    // 7. 等待 MCU 启动
-    udelay(10000);                    // amp_mcu.its 中的 udelay
+    // 5. 分配完整 FIT 缓冲区
+    fit = memalign(ARCH_DMA_MINALIGN, ALIGN(totalsize, part.blksz));
+    if (!fit) {
+        printf("No memory\n");
+        ret = -ENOMEM;
+        goto out2;
+    }
 
-    return 0;
+    // 6. 拷贝头部 + 读取剩余数据
+    memcpy(fit, hdr, FIT_HEADER_SIZE);
+    offset += cnt;
+    cnt = DIV_ROUND_UP(totalsize, part.blksz) - cnt;
+    if (blk_dread(dev_desc, offset, cnt, fit + FIT_HEADER_SIZE) != cnt) {
+        ret = -EIO;
+        goto out1;
+    }
+
+    // 7. 解析并分发 AMP 固件
+    ret = parse_os_amp_dispatcher();
+    if (ret < 0) {
+        ret = -EINVAL;
+        goto out1;
+    }
+
+    // 8. 提取 loadables 并加载到目标内存
+    memset(&images, 0, sizeof(images));
+    images.fit_uname_cfg = "conf";
+    images.fit_hdr_os = fit;
+    images.verify = 1;
+    ret = boot_get_loadable(0, NULL, &images, IH_ARCH_DEFAULT, NULL, NULL);
+    if (ret) {
+        AMP_E("Load loadables, ret=%d\n", ret);
+        goto out1;
+    }
+    flush_dcache_all();
+
+    // 9. 唤醒所有 AMP 核
+    ret = brought_up_all_amp(images.fit_hdr_os, images.fit_uname_cfg);
+    if (ret)
+        AMP_E("Brought up amps, ret=%d\n", ret);
+
+    // ★★ 注意: 这里存在一个 bug — 加载过程中 images 已被
+    // boot_get_loadable() 内部修改, 但 brought_up_all_amp()
+    // 依赖 images.fit_hdr_os 指向有效内存 (即 fit).
+    // 如果 loadable 提取破坏了 images 结构体成员, brought_up_all_amp
+    // 使用的 fit_hdr_os 可能已是悬空指针.
+
+out1:
+    free(fit);
+out2:
+    free(hdr);
+
+    return ret;
 }
 ```
+
+| 阶段 | 操作 | 说明 |
+|------|------|------|
+| 1~2 | 获取设备 + 分区 | `rockchip_get_bootdev()` 获取 eMMC/SD, `AMP_PART` 是 `"amp"` 分区名 |
+| 3~4 | 读 FIT 头 + 解析 | 先读头部验证 FIT 格式, `fit_get_totalsize` 获取总大小 |
+| 5~6 | 分配 + 读完整镜像 | 按 `totalsize` 对齐 `blksz` 分配, 头部拷贝 + 剩余部分读取 |
+| 7~8 | parse + loadables | `parse_os_amp_dispatcher` 解析镜像, `boot_get_loadable` 将 loadable 节加载到 `load` 地址 |
+| 9 | 唤醒 AMP 核 | `brought_up_all_amp` 配置 mailbox/共享内存, 释放 RISC-V 核复位 |
 
 ### 3.3 Linux 侧的 AMP 初始化
 
