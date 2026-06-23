@@ -230,6 +230,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - [[bsp-device-model-dtb-unflatten-deep]] — DTB Unflatten 深入 (阶段二深度)
 - [[bsp-device-model-sysfs-deep]] — sysfs/kobject 机制源码追溯 (阶段二深度)
 - [[bsp-interrupt-concurrency]] — 阶段三
+- [[bsp-interrupt-irqdomain-deep]] — IRQ Domain 源码深挖 (阶段三深度)
 - [[bsp-peripheral-drivers]] — 阶段四
 - [[bsp-power-management]] — 阶段五
 - [[bsp-capstone-driver]] — 阶段六
