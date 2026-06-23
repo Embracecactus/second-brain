@@ -220,6 +220,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - [[bsp-uboot-rktools]] — Rockchip 工具链深度解析 (阶段一工具)
 - [[bsp-uboot-env]] — U-Boot 环境变量系统深度解析 (阶段一配置)
 - [[bsp-uboot-dm-deep]] — U-Boot Driver Model 深度解析 (阶段一核心)
+- [[bsp-uboot-mmc]] — U-Boot MMC 子系统深度解析 (阶段一存储)
 - [[bsp-device-model-dtb]] — 阶段二
 - [[bsp-interrupt-concurrency]] — 阶段三
 - [[bsp-peripheral-drivers]] — 阶段四
