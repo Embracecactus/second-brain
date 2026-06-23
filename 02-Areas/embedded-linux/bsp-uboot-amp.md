@@ -376,10 +376,14 @@ CONFIG_AMP_DTB=y
 
 # Linux 侧 AMP 状态查询:
 cat /sys/rk_amp/boot_cpu     # 显示 AMP 帮助信息
-echo status 0 > /sys/rk_amp/boot_cpu   # 查询 CPU0 AMP 状态 → dmesg
-echo on 0 > /sys/rk_amp/boot_cpu       # 使能 CPU0 AMP 核
+echo status 0 | sudo tee /sys/rk_amp/boot_cpu   # 查询 CPU0 AMP 状态 → dmesg
+echo on 0 | sudo tee /sys/rk_amp/boot_cpu        # 使能 CPU0 AMP 核
 
-dmesg | grep amp              # 查看 AMP 驱动日志
+# 注意: 写入 sysfs 需用 sudo tee 而非 sudo echo >,
+#       因为 > 重定向由当前 shell 执行, sudo 只影响 echo 命令.
+#       也可用 sudo -i 进入 root shell 后直接 echo.
+
+dmesg | grep -i amp         # 查看 AMP 驱动日志
 # 预期输出:
 #   cpu[0] amp is enabled (1)     # AMP 已使能
 #   cpu[0] amp is on (2)          # AMP 核正在运行
