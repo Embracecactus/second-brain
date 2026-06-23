@@ -1,7 +1,7 @@
 ---
 tags: [moc, embedded-linux, career, dji, camera]
 created: 2026-06-09
-updated: 2026-06-22
+updated: 2026-06-23
 target: 大疆相机驱动/嵌入式开发工程师
 strategy: BSP基础 → 相机进阶 两段式路线
 ---
@@ -108,7 +108,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 > 从通用 BSP 转向相机专项。这部分的深度直接决定能否通过大疆相机岗位面试。
 
 ### 阶段七：MIPI CSI 协议 + Camera Sensor 驱动
-> **文档**：`[[bsp-csi-sensor-driver]]` 📋 待生成
+> **文档**：[[bsp-csi-sensor-driver]]
 > **大疆相机核心**：大疆所有相机产品的起点 — Sensor 驱动
 
 - MIPI CSI-2 协议：D-PHY、C-PHY、Lane 配置、Virtual Channel
@@ -121,7 +121,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 **RV1126B 支持 Sensor**：SC200AI, SC4336, SC450AI, SC850SL, IMX335, IMX415, IMX464, IMX586, OV4689, OV13850, GC8034 等
 
 ### 阶段八：V4L2 框架 + ISP Pipeline + Media Controller
-> **文档**：`[[bsp-v4l2-isp-pipeline]]` 📋 待生成 (重写原附录B)
+> **文档**：[[bsp-v4l2-isp-pipeline]]
 > **大疆相机核心**：理解相机数据如何从 Sensor 流到内存
 
 - V4L2 核心框架：video_device / vb2_queue / v4l2_subdev
@@ -133,7 +133,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - 实战：用 media-ctl 画出 RV1126B 相机拓扑图，手动配置管线采集帧
 
 ### 阶段九：ISP 3A 算法 + RKAIQ 集成
-> **文档**：`[[bsp-isp-3a-rkaiq]]` 📋 待生成
+> **文档**：[[bsp-isp-3a-rkaiq]]
 > **大疆相机核心**：3A 是相机画质的核心竞争力
 
 - ISP 处理流水线：BLC → LSC → AWB → Demosaic → NR → Sharpen → CCS → Gamma
@@ -144,7 +144,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - 实战：运行 rkaiq_3A_server，调参观察画质变化，分析 stats 数据流
 
 ### 阶段十：MPP 硬件编解码管线
-> **文档**：`[[bsp-mpp-codec-pipeline]]` 📋 待生成 (重写原附录C)
+> **文档**：[[bsp-mpp-codec-pipeline]]
 > **大疆相机核心**：相机录像/图传的核心 — 硬件 H.265 编码
 
 - MPP 架构：MPI 接口 + mpp_service 内核驱动 + VEPU511 硬件
@@ -154,7 +154,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - 实战：用 MPP 编码一帧 YUV → H.265，对比 CPU 软编性能
 
 ### 阶段十一：RGA 2D 加速 + 图像后处理
-> **文档**：`[[bsp-rga-postprocess]]` 📋 待生成
+> **文档**：[[bsp-rga-postprocess]]
 > **大疆相机核心**：预览缩放、OSD 叠加、EIS 防抖校正
 
 - RGA 硬件：缩放、旋转、格式转换、裁剪、blending
@@ -165,7 +165,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - 实战：用 RGA 做 NV12→RGB 转换 + 缩放，对比 CPU 性能
 
 ### 阶段十二：相机 Capstone — 完整相机管线项目
-> **文档**：`[[bsp-camera-capstone]]` 📋 待生成
+> **文档**：[[bsp-camera-capstone]]
 > **大疆相机核心**：综合项目，面试展示用
 
 - 从零搭建：Sensor 驱动 → ISP 配置 → 3A 启动 → MPP 编码 → 文件保存
@@ -230,13 +230,13 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - [[bsp-power-management]] — 阶段五
 - [[bsp-capstone-driver]] — 阶段六
 
-### 第二段：相机进阶文档 (待生成)
-- `bsp-csi-sensor-driver` — 阶段七
-- `bsp-v4l2-isp-pipeline` — 阶段八
-- `bsp-isp-3a-rkaiq` — 阶段九
-- `bsp-mpp-codec-pipeline` — 阶段十
-- `bsp-rga-postprocess` — 阶段十一
-- `bsp-camera-capstone` — 阶段十二
+### 第二段：相机进阶文档
+- [[bsp-csi-sensor-driver]] — 阶段七
+- [[bsp-v4l2-isp-pipeline]] — 阶段八
+- [[bsp-isp-3a-rkaiq]] — 阶段九
+- [[bsp-mpp-codec-pipeline]] — 阶段十
+- [[bsp-rga-postprocess]] — 阶段十一
+- [[bsp-camera-capstone]] — 阶段十二
 
 ### 附录 (已验证的实验数据)
 - [[kernel-debug-env]] — 附录A：内核调试环境
