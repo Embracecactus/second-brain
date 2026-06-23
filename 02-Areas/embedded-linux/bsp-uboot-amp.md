@@ -385,13 +385,62 @@ echo on 0 | sudo tee /sys/rk_amp/boot_cpu        # 使能 CPU0 AMP 核
 
 dmesg | grep -i amp         # 查看 AMP 驱动日志
 # 预期输出:
+#   cpu[0] amp is disabled (0)    # AMP 未使能
 #   cpu[0] amp is enabled (1)     # AMP 已使能
 #   cpu[0] amp is on (2)          # AMP 核正在运行
+#   cpu[0] is unavailable         # AMP 核未就绪 (MCU 固件未加载)
 
-# 注意: AMP 驱动暴露的唯一 sysfs 接口是 /sys/rk_amp/boot_cpu,
+# 注意: AMP 驱动暴露的唯一 sysfs 接口是 /sys/rk_amp/boot_cpu (sysfs),
 #       不支持 debugfs 或单独的 mailbox/status 文件.
 #       更多调试需通过 rockchip_amp.c 中的 pr_info 输出查看 dmesg.
 ```
+
+### 6.1 sysfs 接口源码
+
+此接口实现在 `drivers/soc/rockchip/rockchip_amp.c`：
+
+```c
+// rockchip_amp.c:117-133 — boot_cpu show 实现
+static ssize_t boot_cpu_show(struct device *dev,
+                             struct device_attribute *attr,
+                             char *buf)
+{
+    char *str = buf;
+
+    str += sprintf(str, "cpu on/off:\n");
+    str += sprintf(str,
+        "         echo on/off [cpu id] > /sys/rk_amp/boot_cpu\n");
+    str += sprintf(str, "get cpu on/off status:\n");
+    str += sprintf(str,
+        "         echo status [cpu id] > /sys/rk_amp/boot_cpu\n");
+    if (str != buf)
+        *(str - 1) = '\n';
+
+    return (str - buf);
+}
+
+// rockchip_amp.c:224-226 — 属性数组
+static struct device_attribute rk_amp_attrs[] = {
+    __ATTR(boot_cpu, 0664, boot_cpu_show, boot_cpu_store),
+};
+
+// rockchip_amp.c:716 — kobject 创建 (sysfs 目录)
+rk_amp_kobj = kobject_create_and_add("rk_amp", NULL);
+// → /sys/rk_amp/ 下挂 boot_cpu 属性
+
+// rockchip_amp.c:135-150 — store 最终调用 ATF SMC 查询状态
+static void cpu_status_print(unsigned long cpu_id, struct arm_smccc_res *res)
+{
+    if (res->a1 == AMP_CPU_STATUS_AMP_DIS)
+        pr_info("cpu[%lx] amp is disabled (%ld)\n", cpu_id, res->a1);
+    else if (res->a1 == AMP_CPU_STATUS_EN)
+        pr_info("cpu[%lx] amp is enabled (%ld)\n", cpu_id, res->a1);
+    else if (res->a1 == AMP_CPU_STATUS_ON)
+        pr_info("cpu[%lx] amp is on (%ld)\n", cpu_id, res->a1);
+}
+```
+
+`boot_cpu_store()` 通过 `arm_smccc_smc` 调用 ATF SMC 指令，由 ATF 固件操作 RISC-V MCU 核的电源状态——这解释了为什么 AMP 电源管理是 ATF 层的职责。`cpu[0] is unavailable` 表示 MCU 固件 (rtt.bin) 未加载到 `0x48c02000`。
 
 ---
 
