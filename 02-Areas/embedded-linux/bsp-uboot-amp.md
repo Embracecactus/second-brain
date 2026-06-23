@@ -374,19 +374,19 @@ CONFIG_AMP_DTB=y
 => amp load 0 0x48c02000     # 手动加载 AMP 固件到地址
 => amp start 0               # 启动 AMP 核
 
-# 板端 Linux 中查看 AMP 状态:
-cat /sys/kernel/debug/amp/status    # AMP 状态
-cat /sys/kernel/debug/amp/mailbox   # Mailbox 状态
-dmesg | grep amp                    # AMP 驱动日志
+# Linux 侧 AMP 状态查询:
+cat /sys/rk_amp/boot_cpu     # 显示 AMP 帮助信息
+echo status 0 > /sys/rk_amp/boot_cpu   # 查询 CPU0 AMP 状态 → dmesg
+echo on 0 > /sys/rk_amp/boot_cpu       # 使能 CPU0 AMP 核
 
-# RPMSG 通信测试:
-# Linux 侧:
-echo "ping" > /dev/rpmsg0
-cat /dev/rpmsg0                     # 预期: "pong"
+dmesg | grep amp              # 查看 AMP 驱动日志
+# 预期输出:
+#   cpu[0] amp is enabled (1)     # AMP 已使能
+#   cpu[0] amp is on (2)          # AMP 核正在运行
 
-# MCU 侧 (RT-Thread):
-# msh > amp_ping
-# 预期: RPMSG ping-pong 测试通过
+# 注意: AMP 驱动暴露的唯一 sysfs 接口是 /sys/rk_amp/boot_cpu,
+#       不支持 debugfs 或单独的 mailbox/status 文件.
+#       更多调试需通过 rockchip_amp.c 中的 pr_info 输出查看 dmesg.
 ```
 
 ---
