@@ -742,6 +742,320 @@ echo "hang 死锁:      $(grep -c 'failed to boot from all' $LOG)"
 
 ---
 
+##### 7.7 BoardRoot systemd init 日志分析
+
+> 板上部署的是 **BoardRoot Ubuntu 22.04**，实际 init 系统采用 **systemd**，非前文 Buildroot 的 BusyBox init。
+> 本节补充 systemd 环境下的日志特征、分析工具和异常诊断方法。
+
+---
+
+###### 7.7.1 内核→systemd 过渡细节
+
+```
+[    1.234567] Freeing unused kernel memory: 2048K           ← Kernel 完成
+[    1.345678] Run /sbin/init as init process                 ← Kernel 启动 init (PID 1)
+               │
+               ├─ kernel_execve("/sbin/init", ...)           ← exec system call
+               │    [进程上下文切换, 进入用户空间]
+               │
+               ├─ systemd[1]: systemd 255 running in system mode (+PAM +AUDIT...)
+               │    ← PID 1 第一条日志
+               │
+               ├─ systemd[1]: Detected architecture arm64.
+               │
+               ├─ systemd[1]: Set hostname to <sportcam>.
+               │
+               ├─ systemd[1]: Initializing timer...
+               ├─ systemd[1]: Reached target Local File Systems.
+               ├─ systemd[1]: Reached target Network.
+               │
+               ├─ systemd[1]: Starting Getty on ttyFIQ0...
+               │
+Welcome to Ubuntu 22.04.5 LTS!                                ← /etc/issue (getty 打印)
+sportcam login:                                               ← 登录提示符
+```
+
+**关键差异 vs BusyBox init：**
+
+| 特性 | Buildroot (BusyBox) | BoardRoot (systemd) |
+|------|--------------------|--------------------|
+| PID 1 | `/sbin/init` → BusyBox init | `/sbin/init` → systemd |
+| 启动顺序 | `/etc/inittab` → `rcS` 遍历 S?? 脚本 | `default.target` → 并行启动 service unit |
+| 日志格式 | `Starting syslogd: OK` (脚本串行输出) | `systemd[1]: Starting Network Manager...` (带单元名) |
+| 依赖管理 | 手动 S?? 编号 | Unit `After=` / `Requires=` 自动排序 |
+| 失败处理 | 脚本返回非0 → 继续下一个 | `OnFailure=`, `Restart=` 自动恢复 |
+| 速度 | 串行启动，较慢 | 并行启动，更快 |
+
+---
+
+###### 7.7.2 systemd 完整启动日志序列
+
+```
+[    1.234567] Run /sbin/init as init process
+               │
+[    1.345678] systemd[1]: systemd 255 running in system mode (+PAM +AUDIT +SELINUX +APPARMOR +IMA +SMACK +SECCOMP +GCRYPT +GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 -IDN +IPTC +KMOD +LIBCRYPTSETUP +LIBFDISK +PCRE2 -PWQUALITY +P11KIT +QRENCODE +TPM2 +BZIP2 +LZ4 +XZ +ZLIB +ZSTD +BPF_FRAMEWORK +XKBCOMMON +UTMP +SYSVINIT default-hierarchy=unified)
+[    1.367890] systemd[1]: Detected architecture arm64.
+[    1.378901] systemd[1]: Set hostname to <sportcam>.
+[    1.412345] systemd[1]: /etc/machine-id missing, using random UUID.
+               │
+               │ ── 核心启动阶段 ──
+[    1.456789] systemd[1]: Initializing timer...
+[    1.467890] systemd[1]: Reached target Timer Units.
+[    1.478901] systemd[1]: Listening on Syslog Socket.
+[    1.489012] systemd[1]: Starting Journal Service...
+[    1.523456] systemd[1]: Started Journal Service.
+[    1.534567] systemd[1]: Starting Load Kernel Modules...
+[    1.578901] systemd[1]: Starting Apply Kernel Variables...
+               │
+               │ ── 文件系统 ──
+[    1.623456] systemd[1]: Started Remount Root and Kernel File Systems.
+[    1.667890] systemd[1]: Started Create Static Device Nodes in /dev.
+[    1.712345] systemd[1]: Reached target Local File Systems.
+               │
+               │ ── 网络 ──
+[    1.756789] systemd[1]: Starting Network Manager...
+[    2.123456] systemd[1]: Started Network Manager.
+[    2.234567] systemd[1]: Reached target Network.
+[    2.345678] systemd[1]: Reached target Network is Online.
+               │
+               │ ── 服务启动 ──
+[    2.456789] systemd[1]: Started SSH Server (started at boot).
+[    2.567890] systemd[1]: Started D-Bus System Message Bus.
+[    2.678901] systemd[1]: Started Getty on ttyFIQ0.
+               │
+               │ ── 达到默认目标 ──
+[    2.789012] systemd[1]: Reached target Multi-User System.
+[    2.890123] systemd[1]: Reached target Graphical Interface.
+[    2.901234] systemd[1]: Startup finished in 1.234s (kernel) + 1.567s (init) = 2.801s.
+               │
+Welcome to Ubuntu 22.04.5 LTS!                                ← /etc/issue
+sportcam login:                                               ← 登录提示符
+```
+
+**grep/sed 定位：**
+
+```bash
+# systemd 第一条日志
+grep -m1 "systemd\[1\]" boot.log
+
+# 内核→init 切换点
+grep -m1 "Run /sbin/init" boot.log
+
+# systemd 启动完成
+grep -m1 "Startup finished in" boot.log
+
+# 各阶段 target 到达
+grep "Reached target" boot.log
+
+# 服务启动 (Starting = 开始, Started = 完成)
+grep -E "Starting|Started" boot.log
+
+# 失败检测
+grep -E "FAILED|failed|timed out" boot.log
+```
+
+---
+
+###### 7.7.3 systemd 分析工具
+
+```bash
+# 板端执行
+
+# 1. 总启动时间分析
+systemd-analyze
+# 输出: Startup finished in 1.234s (kernel) + 1.567s (init) = 2.801s
+#                  └─内核阶段      └─systemd阶段    └─总耗时
+
+# 2. 各服务启动耗时排序
+systemd-analyze blame
+# 输出格式:
+# 1.234s networkd-dispatcher.service
+# 0.567s NetworkManager-wait-online.service
+# 0.345s systemd-resolved.service
+# 0.123s ssh.service
+# ...
+
+# 3. 关键链分析 (找出最长的依赖链)
+systemd-analyze critical-chain
+# 输出:
+# graphical.target @2.801s
+# └─multi-user.target @2.789s
+#   └─NetworkManager.service @2.123s +123ms
+#     └─network-pre.target @2.000s
+#       └─systemd-sysctl.service @1.999s +5ms
+#         └─...
+
+# 4. 单元启动耗时图 (SVG)
+systemd-analyze plot > boot_plot.svg
+# 可在 PC 端用浏览器查看
+
+# 5. 查看服务依赖树
+systemctl list-dependencies multi-user.target
+
+# 6. 查看单元状态
+systemctl status ssh.service
+# 输出: active (running) / failed / inactive
+
+# 7. 列出所有失败的服务
+systemctl --failed
+
+# 8. 查看启动日志 (指定优先级)
+journalctl -b -p err         # 仅错误
+journalctl -b -p warning     # 警告及以上
+journalctl -b --no-pager     # 当前启动全部日志
+
+# 9. 查看特定服务的启动日志
+journalctl -b -u NetworkManager.service
+journalctl -b -u ssh.service
+
+# 10. 启动时间 json 导出 (供脚本分析)
+systemd-analyze dump | grep -E "time=|name="
+```
+
+**完整启动分析脚本：**
+
+```bash
+#!/bin/bash
+# 分析 systemd 启动性能
+
+echo "=== systemd 总启动时间 ==="
+systemd-analyze
+
+echo ""
+echo "=== 最耗时的服务 (top 10) ==="
+systemd-analyze blame | head -10
+
+echo ""
+echo "=== 关键依赖链 ==="
+systemd-analyze critical-chain | head -20
+
+echo ""
+echo "=== 失败的服务 ==="
+systemctl --failed
+
+echo ""
+echo "=== 启动错误日志 ==="
+journalctl -b -p err --no-pager | head -20
+
+echo ""
+echo "=== 内核 vs init 耗时对比 ==="
+systemd-analyze | awk '{print $3, $5, $7}'
+```
+
+---
+
+###### 7.7.4 BoardRoot Ubuntu 服务单元对照表
+
+板上部署的 BoardRoot Ubuntu 22.04 关键服务单元：
+
+| 服务单元 | systemd 单元名 | 对应 Buildroot S?? 脚本 | 作用 |
+|---------|--------------|----------------------|------|
+| SSH 服务器 | `ssh.service` | S50sshd | OpenSSH 远程登录 |
+| D-Bus | `dbus.service` | S30dbus | 系统消息总线 |
+| 网络管理器 | `NetworkManager.service` | S40network | 网络配置 (替代 ifup/ifdown) |
+| 蓝牙 | `bluetooth.service` | S40bluetoothd | BlueZ 蓝牙栈 |
+| 连接管理器 | `connman.service` | S45connman | WiFi/以太网连接 |
+| NTP | `chrony.service` | S49chronyd | 时间同步 |
+| Cron | `cron.service` | S50crond | 定时任务 |
+| PulseAudio | `pulseaudio.service` | S50pulseaudio | 声音服务 |
+| DNS/DHCP | `dnsmasq.service` | S80dnsmasq | DNS 转发 / DHCP 服务器 |
+| 系统日志 | `syslog.service` / `rsyslog.service` | S01syslogd | 系统日志记录 |
+| 内核日志 | `systemd-journald.service` | S02klogd | 内核日志 (systemd 内置) |
+| 设备管理 | `systemd-udevd.service` | S10udev | udev 设备管理器 (systemd 内置) |
+| 终端登录 | `getty@ttyFIQ0.service` | — | getty 在串口上 |
+| **Camera** | `rkaiq_3A_server.service` | S40rkaiq_3A | **3A 服务 (需手动添加)** |
+| **IPC** | `rkipc.service` | — | **运动相机管线 (需手动集成)** |
+
+> **注意**：Camera 相关的 `rkaiq_3A_server` 和 `rkipc` 在 BoardRoot 中可能未自动启用，需要：
+> ```bash
+> systemctl enable rkaiq_3A_server.service
+> systemctl start rkaiq_3A_server.service
+> ```
+
+---
+
+###### 7.7.5 systemd 特有异常诊断
+
+| 现象 | systemd 诊断命令 | 最可能的故障 |
+|------|-----------------|------------|
+| 启动后无 login | `systemctl status getty@ttyFIQ0.service` | getty 未启用或 tty 不存在 |
+| 网络不能用 | `systemctl status NetworkManager.service` | 驱动未加载 / DTS 未启用网口 |
+| SSH 连不上 | `systemctl status ssh.service` | 主机密钥缺失 / 端口被占用 |
+| 系统卡住 X 秒 | `systemd-analyze critical-chain` | 某服务等待超时 (network-online 常见) |
+| USB 设备不识别 | `journalctl -b -u systemd-udevd.service` | udev 规则缺失 / 驱动未 probe |
+| 蓝牙不工作 | `journalctl -b -u bluetooth.service` | 固件缺失 / 硬件不兼容 |
+| 内核崩溃重启 | `journalctl -b -k -p err` | 驱动 bug / OOM / 看门狗 |
+| 某服务反复重启 | `systemctl status <unit> --no-pager` | `Restart=` 策略 + 连续崩溃 |
+| **启动慢 (>30s)** | `systemd-analyze blame \| head -5` | NetworkManager-wait-online 最常背锅 |
+
+**systemd 启动超时调试：**
+
+```bash
+# 1. 哪个服务最慢
+systemd-analyze blame | head -5
+
+# 2. 关键链等待点
+systemd-analyze critical-chain
+
+# 3. 禁用 network-online 等待 (常见优化)
+systemctl mask NetworkManager-wait-online.service
+systemctl mask systemd-networkd-wait-online.service
+
+# 4. 查看特定服务的超时设置
+systemctl show ssh.service | grep Timeout
+```
+
+---
+
+###### 7.7.6 systemd 的 BusyBox/boot.log 兼容适配
+
+如果需要在 **同一个文档** 中同时支持两套 rootfs 分析：
+
+```bash
+# 自动检测 init 类型
+if systemctl --version &>/dev/null; then
+    echo "Init: systemd"
+    systemd-analyze
+else
+    echo "Init: BusyBox (无 systemd)"
+    grep "Starting.*OK" /var/log/boot.log 2>/dev/null || echo "No boot.log found"
+fi
+
+# 兼容的 grep 方式 (同时匹配 BusyBox 和 systemd 日志)
+# 登录就绪:
+grep -m1 -E "Welcome to|login:|sportcam|Startup finished" boot.log
+
+# 服务失败:
+grep -E "FAIL|failed|error!|timed out" boot.log
+
+# 内核完成:
+grep -m1 -E "Freeing unused kernel|Run /sbin/init" boot.log
+```
+
+---
+
+###### 7.7.7 实验：对比 BusyBox vs systemd 启动耗时
+
+```bash
+# 条件: 分别用 Buildroot (BusyBox) 和 BoardRoot (systemd) 启动
+
+# 1. 内核统计 (两套 rootfs 通用)
+dmesg | grep -E "Freeing unused|Run /sbin/init"
+# 预期: 内核耗时基本一致 (因为内核相同)
+
+# 2. 用户空间启动
+# Buildroot: 从 Run /sbin/init 到 login:
+#   → 串行 S?? 脚本, ~500-1000ms
+# BoardRoot (systemd):
+#   → 并行启动, ~800-1500ms (依赖服务更多)
+systemd-analyze | grep "init ="
+
+# 3. 优化预期
+# systemd 可通过 mask 不必要的服务、启用并行、调整 Timeout 提速
+```
+
+---
+
 ## 二、板级适配的 4 层架构
 
 ```
