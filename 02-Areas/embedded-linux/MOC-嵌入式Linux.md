@@ -213,6 +213,8 @@ strategy: BSP基础 → 相机进阶 两段式路线
 
 ### 第一段：BSP 基础文档
 - [[bsp-boot-flow]] — 阶段一
+- [[bsp-spl-fit]] — SPL FIT 解析与验证 (阶段一深度)
+- [[bsp-uboot-adaptation]] — U-Boot 板级适配与启动流程 (阶段一移植)
 - [[bsp-device-model-dtb]] — 阶段二
 - [[bsp-interrupt-concurrency]] — 阶段三
 - [[bsp-peripheral-drivers]] — 阶段四

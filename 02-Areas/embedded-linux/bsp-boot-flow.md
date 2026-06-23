@@ -10,8 +10,8 @@ tags:
   - amp
 category: embedded-linux
 created: 2026-06-22
-updated: 2026-06-22
-status: active
+updated: 2026-06-23
+status: complete
 soc: Rockchip RV1126B
 kernel: Linux 6.1.141
 uboot_config: rv1126b_sportcam
@@ -237,7 +237,69 @@ sudo blkid /dev/mmcblk0p7
 
 ---
 
+## 深度补充：ATF BL31 内存分段加载
+
+> **完整分析**：[[bsp-spl-fit]] — SPL FIT 解析与验证源码追踪
+
+### BL31 ELF 的 4 个 Program Headers
+
+RV1126B 的 ATF BL31 固件 (`rkbin/bin/rv11/rv1126b_bl31_v1.13.elf`) 包含 4 个 `PT_LOAD` 段，分别映射到不同物理内存：
+
+```bash
+readelf -l rv1126b_bl31_v1.13.elf
+```
+
+```
+LOAD  0x3ff1e000  0x1a84   .text_pmusram    → PMU SRAM (低功耗唤醒代码)
+LOAD  0x3ffbb000  0x2000   .text_sram       → System SRAM (安全敏感代码)
+LOAD  0x3ffbd000  0x1000   .data_sram       → System SRAM (数据)
+LOAD  0x40000000  0x15807  .ro/.data/.bss   → DDR (主程序, 86KB→139KB)
+Entry: 0x40000000
+```
+
+### ELF → 多段 .bin → ITS 节点的转换链
+
+```
+rv1126b_bl31_v1.13.elf
+  ↓ decode_bl31.py       (解析 ELF Program Headers, 每个 PT_LOAD → 独立 .bin)
+  ├─ bl31_0x40000000.bin (最大, LZMA 压缩)
+  ├─ bl31_0x3ffbb000.bin (无压缩)
+  ├─ bl31_0x3ff1e000.bin (无压缩)
+  └─ bl31_0x3ffbd000.bin (无压缩)
+  ↓ fit_nodes.sh         (ls -1 -S 按大小排序, 依次生成 ITS 节点)
+  ├─ atf-1 → firmware   (唯一 entry, 可压缩, 有签名)
+  ├─ atf-2 → loadables
+  ├─ atf-3 → loadables
+  └─ atf-4 → loadables
+  ↓ make_fit_atf.sh
+  └─ u-boot.its          (最终 FIT 镜像描述文件)
+```
+
+### RV1126B 内存布局
+
+```
+0x3ff1e000 ┌─────────────────┐ ← PMU SRAM 起始
+           │ atf-3: 6.6KB    │    .text_pmusram
+0x3ff20000 ├─────────────────┤ ← aoa_sram (64KB, DTS)
+           │ (Audio/Alive)   │
+0x3ffb0000 ├─────────────────┤ ← system_sram (64KB, DTS)
+0x3ffbb000 │ atf-2: 8KB      │    .text_sram
+0x3ffbd000 │ atf-4: 4KB      │    .data_sram
+0x3ffc0000 ├─────────────────┤
+           │ ...             │
+0x40000000 ├═════════════════┤ ← DRAM 起始 (DDR)
+           │ atf-1: 139KB    │    BL31 主程序 (ENTRY POINT)
+0x40200000 ├─────────────────┤
+           │ uboot            │    U-Boot proper
+```
+
+> **为什么 SRAM 段不压缩？** System SRAM 总共只有 64KB，LZMA 解压缓冲区需要额外空间，可能超出 SRAM 容量。且 SRAM 中的代码通常是复位后最先执行的安全敏感代码，必须静态签名验签。
+
+---
+
 ## 四、FIT 镜像
+
+> **深度源码分析**：[[bsp-spl-fit]] — SPL 如何解析 FIT、验证 hash/RSA 签名、处理压缩段的 digest 二次校验
 
 ### 4.1 FIT 镜像结构
 
