@@ -223,6 +223,7 @@ strategy: BSP基础 → 相机进阶 两段式路线
 - [[bsp-uboot-mmc]] — U-Boot MMC 子系统深度解析 (阶段一存储)
 - [[bsp-uboot-usb]] — U-Boot USB 子系统深度解析 (阶段一通信)
 - [[bsp-uboot-bringup]] — Board Bring-up 实战诊断指南 (阶段一调试)
+- [[bsp-uboot-amp]] — AMP Boot 详解 (阶段一异构)
 - [[bsp-device-model-dtb]] — 阶段二
 - [[bsp-interrupt-concurrency]] — 阶段三
 - [[bsp-peripheral-drivers]] — 阶段四
