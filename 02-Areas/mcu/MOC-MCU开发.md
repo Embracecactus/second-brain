@@ -32,7 +32,14 @@ Here are all non-MOC `.md` files in the `mcu/` directory:
 - [[zephyr]] — Zephyr RTOS 项目笔记
 - [[zephyr-nxp-notes]] — NXP Zephyr RTOS 开发笔记
 
-19 files total (MOC files excluded). Descriptions are derived from the first meaningful content line of each file.
+## 2024-2026 新芯片/新方向
+
+- [[new-chips-2024-2026]] — 芯片市场扫描 2024-2026: ¥100 内可玩清单
+- [[esp32-c6-p4-h2]] — ESP32 新家族: C6 (WiFi6+Thread) / H2 (Thread) / P4 (MIPI+双核)
+- [[rp2350-pico2]] — RP2350 / Pi Pico 2: 双核异构 (M33+RISC-V) + PIO
+- [[MOC-嵌入式项目创意]] — 嵌入式项目创意地图: 四个方向的稀缺点子
+
+25 files total (MOC files excluded). Descriptions are derived from the first meaningful content line of each file.
 
 ## 相关领域
 
