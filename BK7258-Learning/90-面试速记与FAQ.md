@@ -159,8 +159,8 @@ CP 与 AP 通过 **RPTUN/RPMsg**（基于 mailbox 硬件）通信。
 
 📂 **本文涉及源码路径**
 
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/`（BL1）
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/bl2/`（BL2/MCUboot）
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/ap/`（AP 驱动）
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/cp/`（CP 驱动）
+- `$CONTEST/board/bk7258/bootloader/`（BL1）
+- `$CONTEST/board/bk7258/bootloader/bl2/`（BL2/MCUboot）
+- `$CONTEST/board/bk7258/chip/ap/`（AP 驱动）
+- `$CONTEST/board/bk7258/chip/cp/`（CP 驱动）
 - 各概念展开请回链：[00 导航](./00-开始这里-导航与学习路径.md)

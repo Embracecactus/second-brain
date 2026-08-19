@@ -304,8 +304,8 @@ echo 0 > /dev/gpio1   # 熄灭
 
 📂 **本文涉及源码路径**
 
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/ap/bk7258_i2c.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/ap/bk7258_pwm.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/ap/bk7258_gpioe.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/boards/t5ai_core/src/bk7258_board_bringup.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/Kconfig`
+- `$CONTEST/board/bk7258/chip/ap/bk7258_i2c.c`
+- `$CONTEST/board/bk7258/chip/ap/bk7258_pwm.c`
+- `$CONTEST/board/bk7258/chip/ap/bk7258_gpioe.c`
+- `$CONTEST/board/bk7258/boards/t5ai_core/src/bk7258_board_bringup.c`
+- `$CONTEST/board/bk7258/chip/Kconfig`

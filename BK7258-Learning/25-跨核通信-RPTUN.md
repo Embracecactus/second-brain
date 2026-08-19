@@ -195,9 +195,9 @@ grep -i "rptun\|rpmsg\|mailbox" /path/to/uart_log.txt
 
 📂 **本文涉及源码路径**
 
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/common/bk7258_rptun.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/common/bk7258_rptun_mbox.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/include/bk7258_rptun.h`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/include/bk7258_amp.h`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/include/irq.h`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/docs/bk7258-t5ai/nuttx-port/n9-rptun-source-verification.md`
+- `$CONTEST/board/bk7258/chip/common/bk7258_rptun.c`
+- `$CONTEST/board/bk7258/chip/common/bk7258_rptun_mbox.c`
+- `$CONTEST/board/bk7258/chip/include/bk7258_rptun.h`
+- `$CONTEST/board/bk7258/chip/include/bk7258_amp.h`
+- `$CONTEST/board/bk7258/chip/include/irq.h`
+- `$CONTEST/docs/bk7258-t5ai/nuttx-port/n9-rptun-source-verification.md`

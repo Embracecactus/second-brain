@@ -123,7 +123,7 @@ A/B 分区的核心：**永远保留一份能跑的旧版本**。升级失败时
 ### 步骤 1：打开 CSV 分区表
 
 ```bash
-cd /home/lijian/project/open-vela/contest2026_135_yongwangzhiqian
+cd $CONTEST
 cat board/bk7258/partitions/bk7258/auto_partitions.csv
 ```
 
@@ -159,7 +159,7 @@ BL1 用的 FAL 表是简化版，只包含 4 项：bootloader、cp_app、ap_app�
 如果你想自己算某个分区的结束地址：
 
 ```python
-# 在 /home/lijian/project/open-vela/contest2026_135_yongwangzhiqian 下运行
+# 在 $CONTEST 下运行
 partitions = {
     "bl2":        (0x51d000, 0x22000),
     "primary_cp_app": (0x011000, 0x154000),
@@ -207,7 +207,7 @@ primary_ap_app: 0x165000 - 0x286000 (1156 KiB)
 
 📂 **本文涉及源码路径**
 
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/partitions/bk7258/auto_partitions.csv`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/include/bk7258_partition_layout.h`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/boot_main.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/bl2/bk7258_bl2_flash_map.c`
+- `$CONTEST/board/bk7258/partitions/bk7258/auto_partitions.csv`
+- `$CONTEST/board/bk7258/include/bk7258_partition_layout.h`
+- `$CONTEST/board/bk7258/bootloader/boot_main.c`
+- `$CONTEST/board/bk7258/bootloader/bl2/bk7258_bl2_flash_map.c`

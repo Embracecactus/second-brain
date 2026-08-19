@@ -195,7 +195,7 @@ MCUboot 把 CP 和 AP 视为一个启动对（`IMAGE_NUMBER 2`）。只有两个
 ### 步骤 1：打开配置文件
 
 ```bash
-cd /home/lijian/project/open-vela/contest2026_135_yongwangzhiqian
+cd $CONTEST
 vim board/bk7258/bootloader/bl2/include/mcuboot_config/mcuboot_config.h
 ```
 
@@ -269,10 +269,10 @@ cat bl2.ld
 
 📂 **本文涉及源码路径**
 
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/bl2/bk7258_bl2_main.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/bl2/bk7258_bl2_flash_map.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/bl2/bk7258_bl2_keys.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/bl2/bk7258_bl2_security_cnt.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/bl2/bl2_start.S`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/bl2/bl2.ld`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/bl2/include/mcuboot_config/mcuboot_config.h`
+- `$CONTEST/board/bk7258/bootloader/bl2/bk7258_bl2_main.c`
+- `$CONTEST/board/bk7258/bootloader/bl2/bk7258_bl2_flash_map.c`
+- `$CONTEST/board/bk7258/bootloader/bl2/bk7258_bl2_keys.c`
+- `$CONTEST/board/bk7258/bootloader/bl2/bk7258_bl2_security_cnt.c`
+- `$CONTEST/board/bk7258/bootloader/bl2/bl2_start.S`
+- `$CONTEST/board/bk7258/bootloader/bl2/bl2.ld`
+- `$CONTEST/board/bk7258/bootloader/bl2/include/mcuboot_config/mcuboot_config.h`

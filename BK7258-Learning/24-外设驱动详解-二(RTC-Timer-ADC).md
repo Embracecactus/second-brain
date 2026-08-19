@@ -263,9 +263,9 @@ adc -d /dev/adc0 -n 10   # 读 10 次
 
 📂 **本文涉及源码路径**
 
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/ap/bk7258_rtc.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/ap/bk7258_timer.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/ap/bk7258_saradc.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/ap/bk7258_sdmadc.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/cp/bk7258_wdt.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/cp/bk7258_saradc_server.c`
+- `$CONTEST/board/bk7258/chip/ap/bk7258_rtc.c`
+- `$CONTEST/board/bk7258/chip/ap/bk7258_timer.c`
+- `$CONTEST/board/bk7258/chip/ap/bk7258_saradc.c`
+- `$CONTEST/board/bk7258/chip/ap/bk7258_sdmadc.c`
+- `$CONTEST/board/bk7258/chip/cp/bk7258_wdt.c`
+- `$CONTEST/board/bk7258/chip/cp/bk7258_saradc_server.c`

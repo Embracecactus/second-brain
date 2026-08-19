@@ -140,7 +140,7 @@ sequenceDiagram
 打开终端，一步步验证启动链的入口：
 
 ```bash
-cd /home/lijian/project/open-vela/contest2026_135_yongwangzhiqian
+cd $CONTEST
 
 # 1) 找到 BL1 的 Reset_Handler
 grep -n "Reset_Handler" board/bk7258/bootloader/start.S
@@ -170,7 +170,7 @@ grep -n "bk7258_ap_main" board/bk7258/chip/ap/bk7258_ap_main.c
 如果已经编译过 BL1：
 
 ```bash
-cd /home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader
+cd $CONTEST/board/bk7258/bootloader
 make
 readelf -h bl.elf | grep Entry
 ```
@@ -213,8 +213,8 @@ Entry point address: 0x02000101
 
 📂 **本文涉及源码路径**
 
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/start.S`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/boot_main.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bootloader/bl2/bk7258_bl2_main.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/cp/bk7258_start.c`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/ap/bk7258_ap_main.c`
+- `$CONTEST/board/bk7258/bootloader/start.S`
+- `$CONTEST/board/bk7258/bootloader/boot_main.c`
+- `$CONTEST/board/bk7258/bootloader/bl2/bk7258_bl2_main.c`
+- `$CONTEST/board/bk7258/chip/cp/bk7258_start.c`
+- `$CONTEST/board/bk7258/chip/ap/bk7258_ap_main.c`

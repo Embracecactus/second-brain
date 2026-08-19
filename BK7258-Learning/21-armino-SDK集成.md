@@ -159,7 +159,7 @@ config BK7258_I2C
 ### 步骤 1：列出当前安装的版本
 
 ```bash
-cd /home/lijian/project/open-vela/contest2026_135_yongwangzhiqian
+cd $CONTEST
 ls -la board/bk7258/bk_idk/armino_as_lib/versions/
 ```
 
@@ -194,7 +194,7 @@ ls board/bk7258/bk_idk/armino_as_lib/versions/v3.1.1.9/ap/include/driver/ | head
 ## 21.8 实操：校验 SDK bundle
 
 ```bash
-cd /home/lijian/project/open-vela/contest2026_135_yongwangzhiqian
+cd $CONTEST
 
 # 校验 CP 版本
 ./tools/bk7258/setup_bk7258_sdk.sh --check --version v3.1.1.9 --role cp
@@ -266,10 +266,10 @@ bk7258_sdk_runtime_initialize();
 
 📂 **本文涉及源码路径**
 
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bk_idk/README.md`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bk_idk/armino_as_lib/versions/`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bk_idk/sdk-bundles.cmake`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bk_idk/sdk-profiles/`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/bk_idk/manifests/`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/tools/bk7258/setup_bk7258_sdk.sh`
-- `/home/lijian/project/open-vela/contest2026_135_yongwangzhiqian/board/bk7258/chip/ap/bk7258_peripherals.c`
+- `$CONTEST/board/bk7258/bk_idk/README.md`
+- `$CONTEST/board/bk7258/bk_idk/armino_as_lib/versions/`
+- `$CONTEST/board/bk7258/bk_idk/sdk-bundles.cmake`
+- `$CONTEST/board/bk7258/bk_idk/sdk-profiles/`
+- `$CONTEST/board/bk7258/bk_idk/manifests/`
+- `$CONTEST/tools/bk7258/setup_bk7258_sdk.sh`
+- `$CONTEST/board/bk7258/chip/ap/bk7258_peripherals.c`
