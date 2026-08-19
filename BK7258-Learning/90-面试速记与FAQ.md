@@ -25,7 +25,7 @@
 | BK7258 是什么 | 博通集成（Beken）Wi-Fi 6 + BLE 5.4 Combo SoC，模组为涂鸦 T5-AI |
 | 核心架构 | 3× ARM Cortex-M33：CPU0=CP（控制面，单核）+ CPU1/2=AP（应用面，SMP 双核） |
 | 主频 | DPLL 最高 ~480MHz，产品路径用 320MHz DVFS |
-| 存储 | 片上 Flash ~8MiB（逻辑基址 0x02000000）+ 外接 PSRAM 16MiB |
+| 存储 | 模组内置 Flash ~8MiB（逻辑基址 0x02000000）+ 模组内置 PSRAM 16MiB |
 | 软件栈 | BootROM → BL1 → MCUboot(BL2) → NuttX(CP 单核 + AP SMP) |
 
 ### 启动链（一句话图）
