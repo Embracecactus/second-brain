@@ -211,6 +211,17 @@ Entry point address: 0x02000101
 
 ---
 
+## 🔗 对应代码讲解篇
+
+> 想直接看这些概念的**真实源码**？跳到代码讲解篇（逐文件讲解 + 行号注释）：
+
+- [01 BL1 启动核心](./code/01-bl1-启动核心.md) —— start.S / boot_main / boot_clock 逐段讲解
+- [02 BL1 安全与策略](./code/02-bl1-安全与策略.md) —— Manifest / policy / handoff
+- [03 BL2 MCUboot 外壳](./code/03-bl2-mcuboot外壳.md) —— bl2_start / boot_go / flash_map
+- [04 BL2 加密验签](./code/04-bl2-加密验签.md) —— ECDSA-P256 验签实现
+
+---
+
 📂 **本文涉及源码路径**
 
 - `$CONTEST/board/bk7258/bootloader/start.S`

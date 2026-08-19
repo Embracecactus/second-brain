@@ -267,6 +267,15 @@ cat bl2.ld
 
 ---
 
+## 🔗 对应代码讲解篇
+
+> 想直接看这些概念的**真实源码**？跳到代码讲解篇（逐文件讲解 + 行号注释）：
+
+- [03 BL2 MCUboot 外壳](./code/03-bl2-mcuboot外壳.md) —— bl2_start / main / flash_map / boot_go / security_cnt
+- [04 BL2 加密验签](./code/04-bl2-加密验签.md) —— ECDSA-P256 / ECC / ASN.1 / 公钥
+
+---
+
 📂 **本文涉及源码路径**
 
 - `$CONTEST/board/bk7258/bootloader/bl2/bk7258_bl2_main.c`

@@ -264,6 +264,15 @@ bk7258_sdk_runtime_initialize();
 
 ---
 
+## 🔗 对应代码讲解篇
+
+> 想直接看这些概念的**真实源码**？跳到代码讲解篇（逐文件讲解 + 行号注释）：
+
+- [10 AP 多媒体与无线](./code/10-ap-多媒体与无线.md) —— Wi-Fi / DVP / JPEG / LCD
+- [12 构建与打包工具](./code/12-构建与打包工具.md) —— bkpack / framework / validation
+
+---
+
 📂 **本文涉及源码路径**
 
 - `$CONTEST/board/bk7258/bk_idk/README.md`

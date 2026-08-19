@@ -205,6 +205,14 @@ primary_ap_app: 0x165000 - 0x286000 (1156 KiB)
 
 ---
 
+## 🔗 对应代码讲解篇
+
+> 想直接看这些概念的**真实源码**？跳到代码讲解篇（逐文件讲解 + 行号注释）：
+
+- [13 分区与板级变体](./code/13-分区与板级变体.md) —— 分区生成脚本 / ld.script / 三块板 bringup
+
+---
+
 📂 **本文涉及源码路径**
 
 - `$CONTEST/board/bk7258/partitions/bk7258/auto_partitions.csv`

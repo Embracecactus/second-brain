@@ -193,6 +193,15 @@ grep -i "rptun\|rpmsg\|mailbox" /path/to/uart_log.txt
 
 ---
 
+## 🔗 对应代码讲解篇
+
+> 想直接看这些概念的**真实源码**？跳到代码讲解篇（逐文件讲解 + 行号注释）：
+
+- [06 CP 系统服务](./code/06-cp-系统服务.md) —— mbox / RPMsg 服务端实现
+- [07 AP 启动与 SMP](./code/07-ap-启动与smp.md) —— CPU1/CPU2 SMP 拉起与通信
+
+---
+
 📂 **本文涉及源码路径**
 
 - `$CONTEST/board/bk7258/chip/common/bk7258_rptun.c`
